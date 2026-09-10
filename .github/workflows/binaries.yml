@@ -36,7 +36,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # git describe needs tags
+          fetch-depth: 0 # git describe needs history
+
+      # The fork has no tags of its own, so pull upstream's to get a
+      # meaningful version string (v0.6.0-5-g<sha>) instead of a bare SHA.
+      - name: Fetch upstream tags
+        run: |
+          git remote add upstream https://github.com/tailscale/tailcat.git
+          git fetch -q --tags upstream
 
       - uses: actions/setup-go@v5
         with:
