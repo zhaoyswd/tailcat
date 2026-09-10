@@ -77,14 +77,6 @@ jobs:
           ls -la "${base}."*
           echo "ASSET_BASE=${base}" >> "$GITHUB_ENV"
 
-      - name: Smoke test (Linux only)
-        if: matrix.goos == 'linux'
-        run: |
-          set -eu
-          dist/tailcat --version
-          dist/tailcat genkey --region=1 --fixed-region --key="$RUNNER_TEMP/exit.key" > "$RUNNER_TEMP/addr.txt"
-          head -c 20 "$RUNNER_TEMP/addr.txt"; echo
-
       - uses: actions/upload-artifact@v4
         with:
           name: tailcat_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.goarm }}
@@ -93,6 +85,15 @@ jobs:
             tailcat_*.zip
             tailcat_*.sha256
 
+      # Runs after the upload so a smoke failure never costs us the artifact.
+      # Flags: --fixed-region and --region are mutually exclusive; use the
+      # latter so no network probing is needed.
+      - name: Smoke test (Linux only)
+        if: matrix.goos == 'linux'
+        run: |
+          set -eu
+          dist/tailcat --version
+          HOME="$RUNNER_TEMP" dist/tailcat genkey --region=1 --key=smoke
   release:
     if: startsWith(github.ref, 'refs/tags/')
     needs: build
