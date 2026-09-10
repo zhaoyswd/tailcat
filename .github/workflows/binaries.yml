@@ -10,11 +10,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version string baked into the binary (default: git describe)"
+        description: Version string baked into the binary (default: git describe)
         required: false
   push:
+    branches: [exit-node-udp, main]
     tags: ["v*"]
-    branches: [udp-binaries]
 
 permissions:
   contents: write # required by the release job below
@@ -36,14 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # git describe needs history
-
-      # The fork has no tags of its own, so pull upstream's to get a
-      # meaningful version string (v0.6.0-5-g<sha>) instead of a bare SHA.
-      - name: Fetch upstream tags
-        run: |
-          git remote add upstream https://github.com/tailscale/tailcat.git
-          git fetch -q --tags upstream
+          fetch-depth: 0 # git describe needs tags
 
       - uses: actions/setup-go@v5
         with:
@@ -84,6 +77,14 @@ jobs:
           ls -la "${base}."*
           echo "ASSET_BASE=${base}" >> "$GITHUB_ENV"
 
+      - name: Smoke test (Linux only)
+        if: matrix.goos == 'linux'
+        run: |
+          set -eu
+          dist/tailcat --version
+          dist/tailcat genkey --region=1 --fixed-region --key="$RUNNER_TEMP/exit.key" > "$RUNNER_TEMP/addr.txt"
+          head -c 20 "$RUNNER_TEMP/addr.txt"; echo
+
       - uses: actions/upload-artifact@v4
         with:
           name: tailcat_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.goarm }}
@@ -92,16 +93,6 @@ jobs:
             tailcat_*.zip
             tailcat_*.sha256
 
-      # Runs after the upload so a smoke failure never costs us the artifact.
-      # Flags: --fixed-region and --region are mutually exclusive; use the
-      # latter so no network probing is needed.
-      - name: Smoke test (Linux amd64 only)
-        # The runner is x86_64, so an arm/arm64 build cannot execute here.
-        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
-        run: |
-          set -eu
-          dist/tailcat --version
-          HOME="$RUNNER_TEMP" dist/tailcat genkey --region=1 --key=smoke
   release:
     if: startsWith(github.ref, 'refs/tags/')
     needs: build
