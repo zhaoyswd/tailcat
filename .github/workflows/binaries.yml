@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version string baked into the binary (default: git describe)
+        description: "Version string baked into the binary (default: git describe)"
         required: false
   push:
     branches: [exit-node-udp, main]
