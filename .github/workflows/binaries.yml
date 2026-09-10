@@ -1,0 +1,108 @@
+name: Binaries
+
+# Only exists in this fork: builds tailcat binaries that include the
+# exit-node UDP forwarding patch (branch exit-node-udp).
+#
+# Why bother: the official release job builds linux/windows only, so
+# there is no macOS binary in any release, and the released binaries
+# drop UDP traffic through --serve=exit-node.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version string baked into the binary (default: git describe)
+        required: false
+  push:
+    branches: [exit-node-udp, main]
+    tags: ["v*"]
+
+permissions:
+  contents: write # required by the release job below
+
+jobs:
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: darwin, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm, goarm: "7" }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describe needs tags
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Same recipe as the release build (.goreleaser.yaml): CGO off,
+      # release build tags from build-tags.txt (a test keeps that file
+      # in sync with internal/buildtags.ReleaseTags), version via ldflags.
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+        run: |
+          set -eu
+          TAGS="$(cat build-tags.txt)"
+          VERSION="${{ inputs.version }}"
+          if [ -z "$VERSION" ]; then VERSION="$(git describe --tags --always)"; fi
+          echo "building tailcat ${VERSION} for ${GOOS}/${GOARCH}${GOARM}"
+
+          ext=""
+          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+          mkdir -p dist
+          go build -trimpath -tags="$TAGS" \
+            -ldflags "-s -w -X main.version=${VERSION}" \
+            -o "dist/tailcat${ext}" ./cmd/tailcat
+          cp LICENSE README.md dist/
+
+          base="tailcat_${VERSION}_${GOOS}_${GOARCH}${GOARM}"
+          if [ "$GOOS" = "windows" ]; then
+            (cd dist && zip -q "../${base}.zip" tailcat.exe LICENSE README.md)
+            sha256sum "${base}.zip" > "${base}.sha256"
+          else
+            (cd dist && tar czf "../${base}.tar.gz" tailcat LICENSE README.md)
+            sha256sum "${base}.tar.gz" > "${base}.sha256"
+          fi
+          ls -la "${base}."*
+          echo "ASSET_BASE=${base}" >> "$GITHUB_ENV"
+
+      - name: Smoke test (Linux only)
+        if: matrix.goos == 'linux'
+        run: |
+          set -eu
+          dist/tailcat --version
+          dist/tailcat genkey --region=1 --fixed-region --key="$RUNNER_TEMP/exit.key" > "$RUNNER_TEMP/addr.txt"
+          head -c 20 "$RUNNER_TEMP/addr.txt"; echo
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tailcat_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.goarm }}
+          path: |
+            tailcat_*.tar.gz
+            tailcat_*.zip
+            tailcat_*.sha256
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
