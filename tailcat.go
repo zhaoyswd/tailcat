@@ -2225,29 +2225,6 @@ func (c *Client) ping(ctx context.Context) (PingResult, error) {
 // pinging repeatedly upgrades the connection when NAT traversal is
 // possible. It starts the client and registers with the server first
 // if needed.
-// Rebind forces the client to re-bind its UDP sockets to the current
-// network, reset its DERP connection, and re-STUN, so the tunnel can
-// find a path on a network that just changed under it. Call it (then
-// [Client.Ping] to confirm) whenever the host's network changes:
-// without a control plane handing out endpoints, waiting for
-// magicsock's own timers is the only other option, and on platforms
-// where the kernel link monitor is unavailable that wait is long.
-// Any newly learned endpoints are advertised to the server
-// automatically by the engine status callback.
-func (c *Client) Rebind(ctx context.Context) error {
-	if err := c.ensureStarted(ctx); err != nil {
-		return err
-	}
-	mc := c.lb.sys.MagicSock.Get()
-	if mc == nil {
-		return errors.New("client not started")
-	}
-	// Rebind 的文档要求随后必须 ReSTUN：前者换 socket、重置 DERP，后者重新做
-	// STUN 发现并（在有 netMon 时）刷新本地端点。
-	mc.Rebind()
-	mc.ReSTUN("tailcat rebind")
-	return nil
-}
 
 func (c *Client) DiscoPing(ctx context.Context) (*ipnstate.PingResult, error) {
 	if err := c.up(ctx); err != nil {

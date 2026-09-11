@@ -62,7 +62,6 @@ var (
 	flagListenPort        *int
 	flagAdvertisePort     *int
 	flagForwardProxy      *string
-	flagDNSDoH            *string
 	flagDERPMapURL        *string
 )
 
@@ -116,7 +115,6 @@ func newRootCommand() *ff.Command {
 	flagAdvertisePort = rootFS.IntLong("advertise-port", envInt("TAILCAT_ADVERTISE_PORT"), "external UDP port to advertise to peers as this node's endpoint, overriding the port discovered via UPnP/STUN. Set it when the router forwards a different external port to --listen-port. The default can also be set with the TAILCAT_ADVERTISE_PORT environment variable")
 	flagDERPMapURL = rootFS.StringLong("derpmap-url", cmp.Or(os.Getenv("TAILCAT_DERPMAP_URL"), tailcat.DefaultDERPMapURL), "URL of the JSON DERP map used to resolve or auto-select a DERP region; its default can also be set with the TAILCAT_DERPMAP_URL environment variable")
 	flagForwardProxy = rootFS.StringLong("forward-via-proxy", os.Getenv("TAILCAT_FORWARD_PROXY"), "route the traffic this exit node relays through an upstream proxy, e.g. socks5://127.0.0.1:6153 or http://127.0.0.1:6152. Keeps tailcat's own punch socket direct, which matters when the proxy is a TUN-mode client (see tier docs/EXIT-NODE-SETUP.md). The default can also be set with the TAILCAT_FORWARD_PROXY environment variable")
-	flagDNSDoH = rootFS.StringLong("dns-doh", os.Getenv("TAILCAT_DNS_DOH"), "resolve the tunnel's UDP DNS queries (port 53) with this DNS-over-HTTPS endpoint instead of forwarding them raw, e.g. https://223.5.5.5/dns-query. Requests go through --forward-via-proxy when set, avoiding DNS poisoning on the exit's own line. The default can also be set with the TAILCAT_DNS_DOH environment variable")
 
 	serveFS = ff.NewFlagSet("serve").SetParent(rootFS)
 	flagAllow = serveFS.StringLong("allow", "", "comma-separated list of public keys to allow access to the server, or 'none' to allow no clients. If empty, all clients are allowed.")
@@ -1398,7 +1396,7 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	ci.ServerDiscoPublic = tailcat.DiscoPublicForNode(priv)
 	connStr := ci.Addr()
 
-	if err := setupForwarding(*flagForwardProxy, *flagDNSDoH); err != nil {
+	if err := setupForwarding(*flagForwardProxy); err != nil {
 		log.Fatal(err)
 	}
 	s := &tailcat.Server{Key: priv, PresharedKey: psk, DisablePresharedKey: !usePSK, Logf: logf, Region: reg}
@@ -1472,11 +1470,6 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		// the tunnel is up and TCP works, but every UDP flow silently goes
 		// nowhere. See OnUDPForward and ProxyPacketConns in the README.
 		s.OnUDPForward = func(dst netip.AddrPort) (handler func(tailcat.ConnPacketConn)) {
-			// 配了 --dns-doh 时隧道内 DNS 全部走 DoH（TCP，可经代理）：避开出口线路的 DNS 污染，
-			// 也不必依赖代理对 UDP 的支持。
-			if dnsDoH != "" && dst.Port() == 53 {
-				return serveDoHFlow
-			}
 			return udpForwardTo(dst)
 		}
 	}
