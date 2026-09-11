@@ -1,5 +1,9 @@
 # 为什么用这份 tailcat 构建？和官方版有什么区别
 
+> 这是 `zhaoyswd/tailcat` 的 fork 说明：上游 v0.6.0 + 针对「出口节点」的少量补丁。
+> 下载在 [Releases](https://github.com/zhaoyswd/tailcat/releases)（tag 形如 `v0.6.0-udp.N`；
+> 新增的 macOS 二进制也在那里）。上游 PR #107（UDP 转发）合并后，部分补丁会随之去掉。
+
 这份构建（`github.com/zhaoyswd/tailcat` 的 Releases，版本号形如 `v0.6.0-udp.N`）是
 **官方 v0.6.0 源码 + 少量针对「出口节点」的补丁**。CLI 用法与官方完全兼容，新增的都是可选参数，
 不传就与官方行为一致（除了下面第 1、3 项是修正官方问题）。
