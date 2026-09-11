@@ -346,6 +346,11 @@ type locoBackend struct {
 	presharedKey   PresharedKey
 	isServer       bool
 
+	// mappedPort 是 UPnP 为 magicsock 的 UDP 端口拿到的**外部端口**（0 = 没拿到）。
+	// onEngineStatus 会连同它一起把「公网 IP:该端口」通告给对端 —— 对端于是有一个
+	// 不随重启变化的地址可连，不必赌每次都会变的 STUN 临时映射。
+	mappedPort uint16
+
 	// discoPublic returns the node's disco public key, memoized to
 	// avoid redoing the curve25519 derivation for every client that
 	// joins.
@@ -1486,6 +1491,98 @@ func (b *locoBackend) peerForIP(ip netip.Addr) (_ wgengine.PeerForIP, ok bool) {
 	return zero, false
 }
 
+// advertisePort 由 TAILCAT_ADVERTISE_PORT 指定：出口在路由器上为 magicsock 的（固定）
+// UDP 端口做了端口映射时，把「STUN 学到的公网 IPv4 : 该端口」也通告给对端。
+// 0 = 不额外通告（默认）。
+var advertisePort = func() uint16 {
+	v := os.Getenv("TAILCAT_ADVERTISE_PORT")
+	if v == "" {
+		return 0
+	}
+	p, err := strconv.Atoi(v)
+	if err != nil || p <= 0 || p >= 65536 {
+		log.Printf("TAILCAT_ADVERTISE_PORT=%q 无效，忽略", v)
+		return 0
+	}
+	return uint16(p)
+}()
+
+// stunIPv4 从引擎状态里取出 STUN 学到的公网 IPv4（没有则 ok=false）。
+func stunIPv4(st *wgengine.Status) (netip.Addr, bool) {
+	for _, ep := range st.LocalAddrs {
+		if ep.Type != tailcfg.EndpointSTUN {
+			continue
+		}
+		a := ep.Addr.Addr()
+		if a.Is4() && !a.IsPrivate() {
+			return a, true
+		}
+	}
+	return netip.Addr{}, false
+}
+
+// startPortMapping 在出口（Server）启动后，为 magicsock 的 UDP 端口向路由器申请 UPnP 映射，
+// 成功则记下外部端口供通告使用；每 30 分钟续期一次。失败会明确打日志——
+// 家用路由器常有非标准 UPnP 实现（见 portmapping.go 顶部说明），让人知道该去手动转发。
+func (lb *locoBackend) startPortMapping() {
+	if os.Getenv("TAILCAT_NO_UPNP") != "" {
+		lb.logf("UPnP: 已按 TAILCAT_NO_UPNP 禁用端口映射")
+		return
+	}
+	go func() {
+		for {
+			mc := lb.sys.MagicSock.Get()
+			if mc != nil {
+				if port := mc.LocalPort(); port != 0 {
+					cands := lb.localIPv4Candidates()
+					if len(cands) == 0 {
+						lb.logf("UPnP: 找不到可用的内网 IPv4，跳过端口映射")
+					} else {
+						ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+						ext, usedIP, err := ensurePortMapping(ctx, cands, port, lb.logf)
+						cancel()
+						if err == nil {
+							lb.mu.Lock()
+							lb.mappedPort = ext
+							lb.mu.Unlock()
+							lb.logf("UPnP: 已建立端口映射 外部 UDP %d → %v:%d（对端将拿到公网IP:%d）",
+								ext, usedIP, port, ext)
+						} else {
+							lb.logf("UPnP: 未取得端口映射（%v）；出口在 NAT 后面时对端只能依赖打洞，"+
+								"可在路由器上手动把 UDP %d 转发到本机（候选 %v）", err, port, cands)
+						}
+					}
+				}
+			}
+			time.Sleep(upnpRenewPeriod)
+		}
+	}()
+}
+
+// localIPv4Candidates 列出本机可能用于 UPnP 的内网 IPv4 候选（跳过隧道/回环）。
+// 不能只看默认路由接口：代理类工具（Surge 等）的 utun 常占着默认路由；也不能只取第一个，
+// 一台机器上常有多张虚拟网卡。真正的判据由调用方用 SSDP 自校验（谁能联系上路由器就用谁）。
+func (lb *locoBackend) localIPv4Candidates() []netip.Addr {
+	mon := lb.sys.NetMon.Get()
+	if mon == nil {
+		return nil
+	}
+	st := mon.InterfaceState()
+	var out []netip.Addr
+	for ifName, ips := range st.InterfaceIPs {
+		if ifName == "lo0" || strings.HasPrefix(ifName, "utun") || strings.HasPrefix(ifName, "tun") {
+			continue
+		}
+		for _, ip := range ips {
+			a := ip.Addr()
+			if a.Is4() && !a.IsLoopback() && !a.IsLinkLocalUnicast() {
+				out = append(out, a)
+			}
+		}
+	}
+	return out
+}
+
 // onEngineStatus is the wgengine status callback. It watches for
 // changes to our magicsock UDP endpoints (learned via STUN and from
 // local interfaces) and advertises them to all current peers. Tailcat
@@ -1500,6 +1597,20 @@ func (b *locoBackend) onEngineStatus(st *wgengine.Status, err error) {
 	for _, ep := range st.LocalAddrs {
 		eps = append(eps, ep.Addr)
 	}
+	// 出口在路由器上做了固定端口映射（UPnP / 静态转发）时，把「公网 IPv4 + 该端口」
+	// 一并通告出去：对端于是有一个**不随重启变化**的地址可连，不必赌每次都会变的
+	// STUN 临时映射端口。（外部 IP 直接取自 STUN 端点，映射由路由器负责放行。）
+	port := advertisePort // 环境变量可强制指定
+	if port == 0 {
+		b.mu.Lock()
+		port = b.mappedPort // UPnP 自动拿到的外部端口
+		b.mu.Unlock()
+	}
+	if port != 0 {
+		if pub, ok := stunIPv4(st); ok {
+			eps = append(eps, netip.AddrPortFrom(pub, port))
+		}
+	}
 	slices.SortFunc(eps, func(a, b netip.AddrPort) int { return a.Compare(b) })
 	eps = slices.Compact(eps)
 	b.mu.Lock()
@@ -1509,6 +1620,15 @@ func (b *locoBackend) onEngineStatus(st *wgengine.Status, err error) {
 	}
 	b.mu.Unlock()
 	if changed && len(eps) > 0 {
+		if advertisePort != 0 {
+			// 显式打一条，便于确认「固定端口映射」那一项确实进了通告列表
+			for _, ep := range eps {
+				if ep.Port() == advertisePort && !ep.Addr().IsPrivate() {
+					b.logf("advertise: 通告固定公网端点 %v（路由器上已为 %d 做端口映射）", ep, advertisePort)
+					break
+				}
+			}
+		}
 		go b.advertiseEndpoints()
 	}
 }
@@ -1573,6 +1693,9 @@ func nodeHasAddr(n tailcfg.NodeView, ip netip.Addr) bool {
 func (lb *locoBackend) Start() error {
 	if err := lb.ns.Start(nil /* no LocalBackend */); err != nil {
 		return fmt.Errorf("failed to start netstack: %w", err)
+	}
+	if lb.isServer {
+		lb.startPortMapping()
 	}
 
 	e := lb.sys.Engine.Get()
@@ -1782,19 +1905,17 @@ func newNetstack(logf logger.Logf, sys *tsd.System) (*netstack.Impl, error) {
 // createEngine creates the wgengine.Engine with userspace networking.
 func createEngine(logf logger.Logf, lb *locoBackend) (err error) {
 	sys := &lb.sys
-	// ListenPort defaults to a random port; pinning it via TAILCAT_LISTEN_PORT lets a
-	// local proxy or firewall match "tailcat's own traffic" precisely, by source port
-	// (e.g. Surge: AND,((PROCESS-NAME,tailcat),(SRC-PORT,41641)),DIRECT). That matters
-	// for exit nodes behind a proxy: with the punch/STUN socket going direct, the
-	// advertised endpoint is the host's real public address instead of the proxy's,
-	// and both directions of the hole punch share one NAT mapping. Forwarded client
-	// traffic uses ephemeral ports and is unaffected.
+	// 固定 UDP 源端口（默认随机）。有实际用途：让代理/防火墙能按源端口精确识别
+	// 「tailcat 的打洞与隧道流量」并放它走直连 —— 这样 STUN 学到的是**本机真实公网 IP**，
+	// 而不是代理出口的 IP，且对端打洞的收发两端落在同一个 NAT 映射上；
+	// 而被转发的用户流量用的是临时端口，不受这条规则影响，仍可继续走代理。
+	// 例：Surge 里 AND,((PROCESS-NAME,tailcat),(SRC-PORT,41641)),DIRECT
 	var listenPort uint16
 	if v := os.Getenv("TAILCAT_LISTEN_PORT"); v != "" {
 		if p, perr := strconv.Atoi(v); perr == nil && p > 0 && p < 65536 {
 			listenPort = uint16(p)
 		} else {
-			logf("TAILCAT_LISTEN_PORT=%q invalid; using a random port", v)
+			logf("TAILCAT_LISTEN_PORT=%q 无效，改用随机端口", v)
 		}
 	}
 	conf := wgengine.Config{
@@ -2161,6 +2282,30 @@ func (c *Client) ping(ctx context.Context) (PingResult, error) {
 // pinging repeatedly upgrades the connection when NAT traversal is
 // possible. It starts the client and registers with the server first
 // if needed.
+// Rebind forces the client to re-bind its UDP sockets to the current
+// network, reset its DERP connection, and re-STUN, so the tunnel can
+// find a path on a network that just changed under it. Call it (then
+// [Client.Ping] to confirm) whenever the host's network changes:
+// without a control plane handing out endpoints, waiting for
+// magicsock's own timers is the only other option, and on platforms
+// where the kernel link monitor is unavailable that wait is long.
+// Any newly learned endpoints are advertised to the server
+// automatically by the engine status callback.
+func (c *Client) Rebind(ctx context.Context) error {
+	if err := c.ensureStarted(ctx); err != nil {
+		return err
+	}
+	mc := c.lb.sys.MagicSock.Get()
+	if mc == nil {
+		return errors.New("client not started")
+	}
+	// Rebind 的文档要求随后必须 ReSTUN：前者换 socket、重置 DERP，后者重新做
+	// STUN 发现并（在有 netMon 时）刷新本地端点。
+	mc.Rebind()
+	mc.ReSTUN("tailcat rebind")
+	return nil
+}
+
 func (c *Client) DiscoPing(ctx context.Context) (*ipnstate.PingResult, error) {
 	if err := c.up(ctx); err != nil {
 		return nil, err
