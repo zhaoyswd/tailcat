@@ -85,10 +85,34 @@ advertise: 通告固定公网端点 114.242.60.128:41641
 > 外面看上去就是「UPnP 明明开着却没用」。我们这段代码只做两件必要的事（SSDP 发现 IGD + AddPortMapping），
 > 失败会明确报错，并且不依赖外部实现的行为差异。
 
-### 4. 库 API：`Client.Rebind(ctx)`
+### 4. `--forward-via-proxy`：把「被转发的流量」交给上游代理，同时保留直连打洞
 
-给嵌入 tailcat 的程序用：网络切换后调用它，客户端会在当前网络上重绑 UDP socket、重置 DERP 连接并重新
-STUN（magicsock `Rebind()` + `ReSTUN()`），**不必重建整条隧道**。新端点由引擎状态回调自动通告给对端。
+**问题**：出口主机上常同时跑着一个 TUN 型代理（Surge / Clash 等增强模式）做分流。两种做法都有代价：
+
+| 做法 | 后果（实测） |
+|---|---|
+| 让代理接管路由（TUN 开） | 出口的 UDP 被代理用**自己的 socket** 重发 ⇒ STUN 学到的是代理的映射（实测 `v4a` 端口从 `41641` 变成随机的 `55557/65132`）⇒ 对端拿到的地址打不进来，客户端只能长期走 DERP 中继 |
+| 让代理别碰（TUN 关） | 打洞恢复正常，但**被转发的用户流量也不再经代理** ⇒ 境外站点直连超时（日志里 `error proxying to …: connect: operation timed out`） |
+
+**改动**：`--forward-via-proxy` 让转发的 TCP 显式经代理拨出，**tailcat 自己的打洞 socket 保持直连** —— 两个目标同时满足。
+支持 `socks5://`（SOCKS5 CONNECT）与 `http://`（HTTP CONNECT）。
+
+```bash
+# 出口本机代理监听：Surge 的 *:6153(SOCKS5) / *:6152(HTTP)，Clash 的 mixed-port 同理
+tailcat --listen-port=41641 --forward-via-proxy=socks5://127.0.0.1:6153 serve --key=exit.key exit-node
+# 环境变量（命令行优先）：TAILCAT_FORWARD_PROXY
+```
+
+**效果 / 判据**（都可以自查）：
+
+- 出口 `netcheck` 的 `v4a`/`v6a` 端口仍应**等于 `--listen-port`**（说明打洞 socket 没被代理改写）；
+- 对端日志出现 `link: via=direct`（而不是 `via=derp`）；
+- 出口日志里 `error proxying` 计数为 0；
+- 代理侧能看到这些转发连接（Surge/Clash 的连接日志里按策略走，境内直连、境外走代理）。
+
+**注意**：本参数只影响**被转发**的流量；隧道内的 UDP（QUIC 等）仍按原样由出口直连转发，
+不适合走代理的 UDP 场景（多数代理不支持 UDP ASSOCIATE，实测 Surge 6.9.0 的本地 SOCKS5 直接回 `05 07`）。
+DNS 建议在客户端侧做分流解析（客户端决定哪些域名走境外 DoH）。
 
 ---
 
@@ -121,14 +145,23 @@ tailcat --verbose --listen-port=41641 serve --key=exit.key exit-node
 
 - 路由器支持 UPnP 的话，端口映射会自动建好（看日志确认）；
 - 不支持就手动在路由器上做一条 `UDP 41641 → 出口主机:41641` 的转发；
-- 若出口主机前面还有一层 TUN 型代理（Clash/Surge 之类），要让出口自己的流量走直连，
-  否则 STUN 学到的会是代理的地址、UPnP 也发现不了网关 —— 需要按源端口/域名给代理加放行规则。
+- 若出口主机前面还有一层 TUN 型代理（Clash/Surge 之类）：让代理的 **TUN 保持关闭**（或至少别劫持 tailcat 的 UDP），
+  否则 STUN 学到的会是代理的地址、UPnP 也发现不了网关；转发流量若要经代理，用 `--forward-via-proxy=…`。
 
 ---
 
 ## 与上游的关系
 
-- 改动都基于官方源码，逐个提上游：UDP 转发（PR #107）已在审，其余（`--listen-port`、
-  固定端点通告、`Client.Rebind`）也可提交。
+- 改动都基于官方源码，逐个提上游：UDP 转发（PR #107）已在审，其余（`--listen-port`、`--advertise-port`、
+  固定端点通告与自动 UPnP、`--forward-via-proxy`）也都是通用能力、可单独提交。
 - 上游合并后会逐步从本 fork 去掉重复补丁；fork 只保留上游尚未合并的部分。
 - 构建完全来自官方源码 + 上述补丁，没有其它来源。
+
+### 变更历史（相对官方 v0.6.0）
+
+| 版本 | 变化 |
+|---|---|
+| `v0.6.0-udp.7` | 去掉 `--dns-doh`（改由客户端侧做 DNS 分流解析）与库里的 `Client.Rebind`；保留 `--listen-port`、`--advertise-port`、自动 UPnP 与固定端点通告、exit-node UDP 转发、`--forward-via-proxy` |
+| `v0.6.0-udp.6` | 新增 `--forward-via-proxy` / `--dns-doh` |
+| `v0.6.0-udp.4`–`.5` | 自动 UPnP 端口映射与固定公网端点通告；端口改成正式参数 |
+| `v0.6.0-udp.1`–`.3` | exit-node UDP 转发；固定源端口 |
