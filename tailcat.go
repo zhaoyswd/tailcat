@@ -345,6 +345,9 @@ type locoBackend struct {
 	serverDiscoPub key.DiscoPublic // non-zero if we're a client (server's disco key)
 	presharedKey   PresharedKey
 	isServer       bool
+	// listenPort / advertisePort 来自 Server 配置（0 = 随机 / 由 UPnP 决定）。
+	listenPort    uint16
+	advertisePort uint16
 
 	// mappedPort 是 UPnP 为 magicsock 的 UDP 端口拿到的**外部端口**（0 = 没拿到）。
 	// onEngineStatus 会连同它一起把「公网 IP:该端口」通告给对端 —— 对端于是有一个
@@ -427,6 +430,18 @@ type Server struct {
 	// ignore PresharedKey. This is not recommended, but produces shorter
 	// addresses compatible with tailcat clients v0.5.0 and earlier.
 	DisablePresharedKey bool
+
+	// ListenPort, if non-zero, pins the local UDP port the tunnel binds instead
+	// of choosing a random one. Pinning it lets a router, firewall, or local
+	// proxy match tailcat's own traffic by source port (e.g. to send the punch
+	// socket direct while forwarded traffic keeps using a proxy), and it keeps
+	// server-side port mappings stable across restarts.
+	ListenPort uint16
+
+	// AdvertiseUDPPort, if non-zero, is an external UDP port that peers should
+	// use to reach this server, overriding the port discovered via UPnP/STUN.
+	// Set it when the router forwards a different external port to ListenPort.
+	AdvertiseUDPPort uint16
 
 	// Logf is the logger used for debug messages.
 	// If nil, log.Printf is used.
@@ -649,6 +664,8 @@ func (s *Server) startLocked(ctx context.Context) error {
 	sys.Set(store)
 
 	lb.isServer = true
+	lb.listenPort = s.ListenPort
+	lb.advertisePort = s.AdvertiseUDPPort
 	lb.onDERPRecv = func(regionID tailcfg.DERPRegionID, src key.NodePublic, pkt []byte) bool {
 		if !IsMeowPacket(pkt) {
 			return false
@@ -1600,7 +1617,10 @@ func (b *locoBackend) onEngineStatus(st *wgengine.Status, err error) {
 	// 出口在路由器上做了固定端口映射（UPnP / 静态转发）时，把「公网 IPv4 + 该端口」
 	// 一并通告出去：对端于是有一个**不随重启变化**的地址可连，不必赌每次都会变的
 	// STUN 临时映射端口。（外部 IP 直接取自 STUN 端点，映射由路由器负责放行。）
-	port := advertisePort // 环境变量可强制指定
+	port := b.advertisePort
+	if port == 0 {
+		port = advertisePort // 环境变量
+	}
 	if port == 0 {
 		b.mu.Lock()
 		port = b.mappedPort // UPnP 自动拿到的外部端口
@@ -1910,12 +1930,14 @@ func createEngine(logf logger.Logf, lb *locoBackend) (err error) {
 	// 而不是代理出口的 IP，且对端打洞的收发两端落在同一个 NAT 映射上；
 	// 而被转发的用户流量用的是临时端口，不受这条规则影响，仍可继续走代理。
 	// 例：Surge 里 AND,((PROCESS-NAME,tailcat),(SRC-PORT,41641)),DIRECT
-	var listenPort uint16
-	if v := os.Getenv("TAILCAT_LISTEN_PORT"); v != "" {
-		if p, perr := strconv.Atoi(v); perr == nil && p > 0 && p < 65536 {
-			listenPort = uint16(p)
-		} else {
-			logf("TAILCAT_LISTEN_PORT=%q 无效，改用随机端口", v)
+	listenPort := lb.listenPort
+	if listenPort == 0 {
+		if v := os.Getenv("TAILCAT_LISTEN_PORT"); v != "" {
+			if p, perr := strconv.Atoi(v); perr == nil && p > 0 && p < 65536 {
+				listenPort = uint16(p)
+			} else {
+				logf("TAILCAT_LISTEN_PORT=%q 无效，改用随机端口", v)
+			}
 		}
 	}
 	conf := wgengine.Config{
