@@ -162,3 +162,6 @@ tailcat --verbose --listen-port=41641 serve --key=exit.key exit-node
 | `v0.6.0-udp.6` | 新增 `--forward-via-proxy` / `--dns-doh` |
 | `v0.6.0-udp.4`–`.5` | 自动 UPnP 端口映射与固定公网端点通告；端口改成正式参数 |
 | `v0.6.0-udp.1`–`.3` | exit-node UDP 转发；固定源端口 |
+
+> 2026-09-11 文档更正：**官方 macOS 版通过 Homebrew 安装**（homebrew-core，`brew install tailcat`，实测 stable 0.6.0 bottled）；
+> GitHub Release 只有 linux/windows。brew 那份不含本 fork 的出口侧增强。
