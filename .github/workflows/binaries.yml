@@ -60,7 +60,9 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           set -eu
-          TAGS="$(cat build-tags.txt)"
+          # 去掉 ts_omit_portmapper：出口节点若在会做 UPnP/NAT-PMP 的路由器后面，
+          # 就能自动拿到稳定的端口映射（App 侧核仍带该 tag，省体积）。
+          TAGS="$(tr ',' '\n' < build-tags.txt | grep -v '^ts_omit_portmapper$' | paste -sd, -)"
           VERSION="${{ inputs.version }}"
           if [ -z "$VERSION" ]; then VERSION="$(git describe --tags --always)"; fi
           echo "building tailcat ${VERSION} for ${GOOS}/${GOARCH}${GOARM}"
