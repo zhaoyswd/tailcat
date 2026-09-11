@@ -1538,68 +1538,6 @@ func stunIPv4(st *wgengine.Status) (netip.Addr, bool) {
 	return netip.Addr{}, false
 }
 
-// startPortMapping 在出口（Server）启动后，为 magicsock 的 UDP 端口向路由器申请 UPnP 映射，
-// 成功则记下外部端口供通告使用；每 30 分钟续期一次。失败会明确打日志——
-// 家用路由器常有非标准 UPnP 实现（见 portmapping.go 顶部说明），让人知道该去手动转发。
-func (lb *locoBackend) startPortMapping() {
-	if os.Getenv("TAILCAT_NO_UPNP") != "" {
-		lb.logf("UPnP: 已按 TAILCAT_NO_UPNP 禁用端口映射")
-		return
-	}
-	go func() {
-		for {
-			mc := lb.sys.MagicSock.Get()
-			if mc != nil {
-				if port := mc.LocalPort(); port != 0 {
-					cands := lb.localIPv4Candidates()
-					if len(cands) == 0 {
-						lb.logf("UPnP: 找不到可用的内网 IPv4，跳过端口映射")
-					} else {
-						ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
-						ext, usedIP, err := ensurePortMapping(ctx, cands, port, lb.logf)
-						cancel()
-						if err == nil {
-							lb.mu.Lock()
-							lb.mappedPort = ext
-							lb.mu.Unlock()
-							lb.logf("UPnP: 已建立端口映射 外部 UDP %d → %v:%d（对端将拿到公网IP:%d）",
-								ext, usedIP, port, ext)
-						} else {
-							lb.logf("UPnP: 未取得端口映射（%v）；出口在 NAT 后面时对端只能依赖打洞，"+
-								"可在路由器上手动把 UDP %d 转发到本机（候选 %v）", err, port, cands)
-						}
-					}
-				}
-			}
-			time.Sleep(upnpRenewPeriod)
-		}
-	}()
-}
-
-// localIPv4Candidates 列出本机可能用于 UPnP 的内网 IPv4 候选（跳过隧道/回环）。
-// 不能只看默认路由接口：代理类工具（Surge 等）的 utun 常占着默认路由；也不能只取第一个，
-// 一台机器上常有多张虚拟网卡。真正的判据由调用方用 SSDP 自校验（谁能联系上路由器就用谁）。
-func (lb *locoBackend) localIPv4Candidates() []netip.Addr {
-	mon := lb.sys.NetMon.Get()
-	if mon == nil {
-		return nil
-	}
-	st := mon.InterfaceState()
-	var out []netip.Addr
-	for ifName, ips := range st.InterfaceIPs {
-		if ifName == "lo0" || strings.HasPrefix(ifName, "utun") || strings.HasPrefix(ifName, "tun") {
-			continue
-		}
-		for _, ip := range ips {
-			a := ip.Addr()
-			if a.Is4() && !a.IsLoopback() && !a.IsLinkLocalUnicast() {
-				out = append(out, a)
-			}
-		}
-	}
-	return out
-}
-
 // onEngineStatus is the wgengine status callback. It watches for
 // changes to our magicsock UDP endpoints (learned via STUN and from
 // local interfaces) and advertises them to all current peers. Tailcat
