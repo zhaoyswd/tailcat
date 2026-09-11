@@ -32,8 +32,8 @@ import (
 // forwardProxy 非空时，被转发的 TCP 连接经它拨出。
 var forwardProxy *url.URL
 
-// setupForwarding 解析 --forward-via-proxy（可省略）。
-func setupForwarding(proxyStr string) error {
+// setupForwardingURL 解析 --forward-via-proxy（可省略）。
+func setupForwardingURL(proxyStr string) error {
 	if proxyStr != "" {
 		u, err := url.Parse(proxyStr)
 		if err != nil {

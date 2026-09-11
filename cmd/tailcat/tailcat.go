@@ -59,9 +59,6 @@ var (
 	flagVerbose           *bool
 	flagFullAddress       *bool
 	flagJSON              *bool
-	flagListenPort        *int
-	flagAdvertisePort     *int
-	flagForwardProxy      *string
 	flagDERPMapURL        *string
 )
 
@@ -89,32 +86,17 @@ func getLogf() logger.Logf {
 	return logger.Discard
 }
 
-// envInt 读一个整数环境变量（供 flag 默认值使用；无效或未设返回 0）。
-func envInt(name string) int {
-	v := os.Getenv(name)
-	if v == "" {
-		return 0
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 0 || n >= 65536 {
-		return 0
-	}
-	return n
-}
-
 // newRootCommand builds the tailcat command tree. It must only be
 // called once per process outside of tests, as it resets the
 // package-level flag value pointers.
 func newRootCommand() *ff.Command {
 	rootFS := ff.NewFlagSet("tailcat")
+	registerExitNodeFlags(rootFS)
 	flagServe = rootFS.StringLong("serve", "", "comma-separated list of port numbers, port ranges, or service names to serve; the same list the serve subcommand takes as arguments. Service names are: 'all' (serve all ports), 'exit-node' (run an exit node for all addresses), 'ssh' (public-key-authenticated SSH server; see serve's --ssh-authorized-keys flag), 'no-auth-ssh' (auth-free SSH server), 'files' (file server for SFTP clients; see serve's --files flag), 'exec' (run the command after -- for each connection, with the connection as its stdio). If empty, it accepts a single connection on any port, writes it to stdout, and exits.")
 	flagKey = rootFS.StringLong("key", "", "'new' for an ephemeral key. If empty, the default saved key is used if it exists ('default' in server mode, 'client-default' in client modes; see genkey), else an ephemeral key. Otherwise the path to a *.private.json or a name like 'foo' to read it from $CONFIG/tailcat/keys/foo.private.json")
 	flagVerbose = rootFS.BoolLong("verbose", "be verbose")
 	flagJSON = rootFS.BoolLong("json", "in server mode, write {\"listenAddr\": ...} JSON to stdout")
-	flagListenPort = rootFS.IntLong("listen-port", envInt("TAILCAT_LISTEN_PORT"), "pin the local UDP port the tunnel binds instead of choosing a random one. Pinning it lets a router, firewall, or local proxy match tailcat's own traffic by source port (e.g. send the punch socket direct while forwarded traffic keeps using a proxy) and keeps port mappings stable across restarts. The default can also be set with the TAILCAT_LISTEN_PORT environment variable")
-	flagAdvertisePort = rootFS.IntLong("advertise-port", envInt("TAILCAT_ADVERTISE_PORT"), "external UDP port to advertise to peers as this node's endpoint, overriding the port discovered via UPnP/STUN. Set it when the router forwards a different external port to --listen-port. The default can also be set with the TAILCAT_ADVERTISE_PORT environment variable")
 	flagDERPMapURL = rootFS.StringLong("derpmap-url", cmp.Or(os.Getenv("TAILCAT_DERPMAP_URL"), tailcat.DefaultDERPMapURL), "URL of the JSON DERP map used to resolve or auto-select a DERP region; its default can also be set with the TAILCAT_DERPMAP_URL environment variable")
-	flagForwardProxy = rootFS.StringLong("forward-via-proxy", os.Getenv("TAILCAT_FORWARD_PROXY"), "route the traffic this exit node relays through an upstream proxy, e.g. socks5://127.0.0.1:6153 or http://127.0.0.1:6152. Keeps tailcat's own punch socket direct, which matters when the proxy is a TUN-mode client (see tier docs/EXIT-NODE-SETUP.md). The default can also be set with the TAILCAT_FORWARD_PROXY environment variable")
 
 	serveFS = ff.NewFlagSet("serve").SetParent(rootFS)
 	flagAllow = serveFS.StringLong("allow", "", "comma-separated list of public keys to allow access to the server, or 'none' to allow no clients. If empty, all clients are allowed.")
@@ -1396,15 +1378,15 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	ci.ServerDiscoPublic = tailcat.DiscoPublicForNode(priv)
 	connStr := ci.Addr()
 
-	if err := setupForwarding(*flagForwardProxy); err != nil {
+	if err := setupForwarding(); err != nil {
 		log.Fatal(err)
 	}
 	s := &tailcat.Server{Key: priv, PresharedKey: psk, DisablePresharedKey: !usePSK, Logf: logf, Region: reg}
-	if *flagListenPort > 0 && *flagListenPort < 65536 {
-		s.ListenPort = uint16(*flagListenPort)
+	if p := listenPortFlag(); p > 0 && p < 65536 {
+		s.ListenPort = uint16(p)
 	}
-	if *flagAdvertisePort > 0 && *flagAdvertisePort < 65536 {
-		s.AdvertiseUDPPort = uint16(*flagAdvertisePort)
+	if p := advertisePortFlag(); p > 0 && p < 65536 {
+		s.AdvertiseUDPPort = uint16(p)
 	}
 	sshServices := services.Contains("ssh") || services.Contains("no-auth-ssh") || services.Contains("files")
 	if sshServices && !tailcat.SupportsSSHServer() {
