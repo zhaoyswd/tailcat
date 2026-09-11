@@ -51,9 +51,11 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1701,8 +1703,23 @@ func newNetstack(logf logger.Logf, sys *tsd.System) (*netstack.Impl, error) {
 // createEngine creates the wgengine.Engine with userspace networking.
 func createEngine(logf logger.Logf, lb *locoBackend) (err error) {
 	sys := &lb.sys
+	// ListenPort defaults to a random port; pinning it via TAILCAT_LISTEN_PORT lets a
+	// local proxy or firewall match "tailcat's own traffic" precisely, by source port
+	// (e.g. Surge: AND,((PROCESS-NAME,tailcat),(SRC-PORT,41641)),DIRECT). That matters
+	// for exit nodes behind a proxy: with the punch/STUN socket going direct, the
+	// advertised endpoint is the host's real public address instead of the proxy's,
+	// and both directions of the hole punch share one NAT mapping. Forwarded client
+	// traffic uses ephemeral ports and is unaffected.
+	var listenPort uint16
+	if v := os.Getenv("TAILCAT_LISTEN_PORT"); v != "" {
+		if p, perr := strconv.Atoi(v); perr == nil && p > 0 && p < 65536 {
+			listenPort = uint16(p)
+		} else {
+			logf("TAILCAT_LISTEN_PORT=%q invalid; using a random port", v)
+		}
+	}
 	conf := wgengine.Config{
-		ListenPort:    0,
+		ListenPort:    listenPort,
 		NetMon:        sys.NetMon.Get(),
 		Dialer:        sys.Dialer.Get(),
 		SetSubsystem:  sys.Set,
