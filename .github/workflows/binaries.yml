@@ -13,7 +13,8 @@ on:
         description: "Version string baked into the binary (default: git describe)"
         required: false
   push:
-    branches: [exit-node-udp, main]
+    # 只在打 tag 时自动构建（`v*`）；分支上要跑就在 Actions 页手动 Run workflow。
+    # 两个分支上的这份文件要保持一致 —— tag 事件用的是**默认分支**上的工作流。
     tags: ["v*"]
 
 permissions:
