@@ -37,8 +37,10 @@
 同一现象在真实链路上也复现过：客户端侧 102 个 UDP 上行包、**0 个下行包**。
 
 **改动**：在 exit-node 分支补上 `OnUDPForward`（用官方库自带的 `ProxyPacketConns` 做双向转发），
-约三行。已提上游 [PR #107](https://github.com/tailscale/tailcat/pull/107)（带一个
-`TestServeExitNodeUDP`：在官方 main 上以 `i/o timeout` 失败、打上补丁即通过），合并后即可回到官方版。
+约三行。该修复**已合并进上游 main**（[PR #107](https://github.com/tailscale/tailcat/pull/107)，2026-09-13，
+未改写，含我们在官方 main 上以 `i/o timeout` 失败、打上补丁即通过的 `TestServeExitNodeUDP`）；
+不过它还没进任何上游发行版（最新 release 仍是 v0.6.0），所以本 fork 目前继续带着这段补丁 —— 等下一个上游 tag
+之后就能回到官方版。
 
 ### 2. 新增 `--listen-port`：把本地 UDP 端口固定下来（默认仍是随机）
 
@@ -182,7 +184,7 @@ tailcat --verbose --listen-port=41641 serve --key=exit.key exit-node
 
 ## 与上游的关系
 
-- 改动都基于官方源码，逐个提上游：UDP 转发（PR #107）已在审，其余（`--listen-port`、`--advertise-port`、
+- 改动都基于官方源码，逐个提上游：UDP 转发（PR #107）**已合并进上游 main**（2026-09-13，未改写），其余（`--listen-port`、`--advertise-port`、
   固定端点通告与自动 UPnP、`--forward-via-proxy`、`--forward-udp`）也都是通用能力、可单独提交。
 - 上游合并后会逐步从本 fork 去掉重复补丁；fork 只保留上游尚未合并的部分。
 - 构建完全来自官方源码 + 上述补丁，没有其它来源。
