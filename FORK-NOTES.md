@@ -201,7 +201,7 @@ tailcat --verbose --listen-port=41641 serve --key=exit.key exit-node
 
 | 版本 | 变化 |
 |---|---|
-| `v0.6.0-udp.10` | （未发布）分支 rebase 到上游 main：UDP 转发补丁回归上游、只留本 fork 的增量 |
+| `v0.6.0-udp.10` | 分支 rebase 到上游 main（含已合并的 exit-node UDP 转发）：产物 = 上游 main + 本 fork 的 5 项增量，代码差异从"一堆补丁"降到 10 个文件；CI 改成只在打 tag / 手动触发时构建 |
 | `v0.6.0-udp.9` | 新增 `--forward-udp`：被转发的 UDP 也能经代理（SOCKS5 UDP ASSOCIATE + 能力探测，`auto` 不支持则回落直出） |
 | `v0.6.0-udp.8` | 代码结构整理（CLI 专用代码移出共享文件，功能同 .7），便于跟上游长期对齐 |
 | `v0.6.0-udp.7` | 去掉 `--dns-doh`（改由客户端侧做 DNS 分流解析）与库里的 `Client.Rebind`；保留 `--listen-port`、`--advertise-port`、自动 UPnP 与固定端点通告、exit-node UDP 转发、`--forward-via-proxy` |
