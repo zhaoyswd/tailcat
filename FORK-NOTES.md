@@ -106,9 +106,43 @@ tailcat --listen-port=41641 --forward-via-proxy=socks5://127.0.0.1:6153 serve --
 - 出口日志里 `error proxying` 计数为 0；
 - 代理侧能看到这些转发连接（Surge/Clash 的连接日志里按策略走，境内直连、境外走代理）。
 
-**注意**：本参数只影响**被转发**的流量；隧道内的 UDP（QUIC 等）仍按原样由出口直连转发，
-不适合走代理的 UDP 场景（多数代理不支持 UDP ASSOCIATE，实测 Surge 6.9.0 的本地 SOCKS5 直接回 `05 07`）。
-DNS 建议在客户端侧做分流解析（客户端决定哪些域名走境外 DoH）。
+**注意**：本参数只影响**被转发**的 TCP；被转发的 UDP 见下一条。
+
+### 5. `--forward-udp`：被转发的 UDP 也能经代理（先探测再决定）
+
+**问题**：上一条只让 TCP 走代理，被转发的 UDP（QUIC、游戏、纯 UDP 服务）是**直连写死**的
+（`net.DialUDP`），出口侧没有代理可走。
+
+**改动**：新增 SOCKS5 的 UDP 客户端（`UDP ASSOCIATE` + 按 RFC1928 逐包封装），并在启动/首次用到时
+**探测代理是否真的能承载 UDP**：`REP=0x07/0x02` 是确定性否定；`REP=0` 只算"声称支持"，还要发一个
+STUN Binding 请求确认数据确实被中继（**字面 IP** 目标、校验 magic cookie 与事务 ID）。结论按代理端点缓存。
+
+| `--forward-udp` | 行为 |
+|---|---|
+| `auto`（默认） | 第一次需要转发 UDP 时探测：能承载就经代理，不能就**回落直出并在日志里写明原因** |
+| `on` | 必须经代理，探测不通过就**启动即失败**（不静默降级） |
+| `off` | 不做 UDP 代理（等于以前的行为） |
+
+```bash
+tailcat --listen-port=41641 --forward-via-proxy=socks5://127.0.0.1:1080 --forward-udp=auto \
+        serve --key=exit.key exit-node
+# 环境变量（命令行优先）：TAILCAT_FORWARD_UDP
+```
+
+**前提**：代理服务端**必须支持 UDP** —— 只有 `socks5://` 能承载（HTTP 代理没有这个通道）。
+**Surge 6.9.0 的 SOCKS5 入站不支持**（实测 `REP=0x07`），所以指向它时会判"不支持"并回落直出（与以前行为一致）；
+**mihomo / sing-box / Xray 的 socks 入站原生支持**。
+
+**判据**（三行日志，都能 grep）：
+
+```
+forward-udp: 代理 127.0.0.1:1080 支持 UDP（探针 172.238.7.124:3478 收到可校验应答（…））—— 被转发的 UDP 走 经代理
+forward-udp: 代理 127.0.0.1:6153 不支持 UDP（UDP ASSOCIATE 被拒：不支持该命令（0x07，…））—— 被转发的 UDP 走 直出
+udp forward -> 1.1.1.1:443 (via socks5://127.0.0.1:1080)      # 每条流自己说明路径
+```
+
+**代理不支持、可自证**的时候，日志里也会写 `direct(代理不支持 UDP：…)`；**探测本身失败**（连不上代理）
+同样回落直出并把原因写进 `via`。排障可以用 `socks-udp-check.py`（见仓库 docs）。
 
 ---
 
@@ -149,7 +183,7 @@ tailcat --verbose --listen-port=41641 serve --key=exit.key exit-node
 ## 与上游的关系
 
 - 改动都基于官方源码，逐个提上游：UDP 转发（PR #107）已在审，其余（`--listen-port`、`--advertise-port`、
-  固定端点通告与自动 UPnP、`--forward-via-proxy`）也都是通用能力、可单独提交。
+  固定端点通告与自动 UPnP、`--forward-via-proxy`、`--forward-udp`）也都是通用能力、可单独提交。
 - 上游合并后会逐步从本 fork 去掉重复补丁；fork 只保留上游尚未合并的部分。
 - 构建完全来自官方源码 + 上述补丁，没有其它来源。
 
@@ -157,6 +191,7 @@ tailcat --verbose --listen-port=41641 serve --key=exit.key exit-node
 
 | 版本 | 变化 |
 |---|---|
+| `v0.6.0-udp.9` | 新增 `--forward-udp`：被转发的 UDP 也能经代理（SOCKS5 UDP ASSOCIATE + 能力探测，`auto` 不支持则回落直出） |
 | `v0.6.0-udp.8` | 代码结构整理（CLI 专用代码移出共享文件，功能同 .7），便于跟上游长期对齐 |
 | `v0.6.0-udp.7` | 去掉 `--dns-doh`（改由客户端侧做 DNS 分流解析）与库里的 `Client.Rebind`；保留 `--listen-port`、`--advertise-port`、自动 UPnP 与固定端点通告、exit-node UDP 转发、`--forward-via-proxy` |
 | `v0.6.0-udp.6` | 新增 `--forward-via-proxy` / `--dns-doh` |

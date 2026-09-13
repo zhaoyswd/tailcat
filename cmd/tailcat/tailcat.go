@@ -1378,7 +1378,7 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	ci.ServerDiscoPublic = tailcat.DiscoPublicForNode(priv)
 	connStr := ci.Addr()
 
-	if err := setupForwarding(); err != nil {
+	if err := setupForwarding(reg); err != nil {
 		log.Fatal(err)
 	}
 	s := &tailcat.Server{Key: priv, PresharedKey: psk, DisablePresharedKey: !usePSK, Logf: logf, Region: reg}
@@ -1433,12 +1433,15 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 
 	udpForwardTo := func(dst netip.AddrPort) func(tailcat.ConnPacketConn) {
 		return func(c tailcat.ConnPacketConn) {
-			localConn, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(dst))
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			localConn, via, err := dialForwardUDP(ctx, dst)
+			cancel()
 			if err != nil {
 				logf("error proxying to %v: %v", dst, err)
 				c.Close()
 				return
 			}
+			logf("udp forward -> %v (via %s)", dst, via)
 			tailcat.ProxyPacketConns(c, localConn)
 		}
 	}
