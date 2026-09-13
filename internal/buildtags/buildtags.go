@@ -16,11 +16,14 @@ import (
 	"tailscale.com/feature/featuretags"
 )
 
-// baseTags are non-feature build tags included in every tailcat
-// build: osusergo and netgo select the pure Go user and DNS resolver
-// implementations, and omitidna and omitpemdecrypt drop unused code
-// from tailscale.com dependencies.
-var baseTags = []string{"osusergo", "netgo", "omitidna", "omitpemdecrypt"}
+// The tag lists are purely ts_omit_ feature tags. They deliberately
+// exclude some non-feature tags used in the past: netgo and osusergo
+// are redundant with the CGO_ENABLED=0 official builds already use
+// for static binaries, and netgo additionally forces Go's pure DNS
+// resolver on Windows and macOS, which broke resolving "localhost" on
+// Windows (issue #108). omitidna and omitpemdecrypt only ever meant
+// something to the tailscale/go fork toolchain, not the stock Go
+// toolchain tailcat builds with.
 
 // wasmKeep is the set of tailscale.com feature tags the wasm build
 // needs linked, following cmd/tsconnect/wasmbuild. tailcat uses the
@@ -67,7 +70,7 @@ func tags(keep []featuretags.FeatureTag) string {
 			keepSet[dep] = true
 		}
 	}
-	tags := slices.Clone(baseTags)
+	var tags []string
 	for ft := range featuretags.Features {
 		if ft == "" || !ft.IsOmittable() {
 			continue

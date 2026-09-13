@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- `--serve=exit-node` servers now forward UDP flows; previously only
+  TCP was forwarded, so DNS, QUIC, and other UDP traffic through an
+  exit node went nowhere.
+- Serving local ports works from Windows: the server resolves
+  `localhost` itself instead of using the hosts file, which Windows
+  ships without localhost entries, so the name no longer escapes to
+  real DNS servers. It also dials both 127.0.0.1 and ::1, reaching
+  services bound to only one loopback address. Official binaries also
+  no longer build with the `netgo` tag that forced Go's pure resolver
+  on Windows and macOS; they now use the operating system's resolver
+  there, like a default `go build` does.
+  ([#108](https://github.com/tailscale/tailcat/issues/108), reported
+  by [@Sammy-T](https://github.com/Sammy-T))
+- Go library: the new `Server.Listen(ctx, network, address)` serves
+  TCP and UDP ports in the standard `net.Listener` shape, as an
+  alternative to the `OnTCP` and `OnUDP` hooks; for UDP, each Accept
+  returns one client flow as a `net.Conn`. Listeners claim their
+  specific ports ahead of the wildcard hooks, and Listen starts the
+  server if it isn't running yet.
 - `tailcat forward` takes an `--open-browser` flag that opens a web
   browser to the forwarded local port; `tailcat browse <tc-addr>` is
   an alias for `tailcat forward --open-browser <tc-addr> 0:80`.
@@ -11,6 +30,17 @@
   command after `--` instead replaces the shell for every session,
   like OpenSSH's `ForceCommand`, with no shell, client-chosen command,
   or SFTP offered.
+- `tailcat ssh` to a DNS-named destination first probes the server the
+  way a stranger would, with no credentials, and refuses to connect if
+  the server hands out a shell to anyone, since an address published
+  in DNS is public; `--skip-dns-safety-check` opts out. The README,
+  the root help's DNS section, and `serve no-auth-ssh` startup now all
+  warn that DNS-published addresses need `--allow` or
+  `--ssh-authorized-keys`.
+  ([#100](https://github.com/tailscale/tailcat/issues/100))
+- Fixed argument parsing under Termux on Android, whose loader inserts
+  the executable's path as an extra argument.
+  ([#92](https://github.com/tailscale/tailcat/pull/92), [@shaunlee](https://github.com/shaunlee))
 
 ## v0.6.0 (2026-09-04)
 

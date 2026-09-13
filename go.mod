@@ -19,6 +19,7 @@ require (
 	go4.org/netipx v0.0.0-20260823151212-3075585bcbeb
 	golang.org/x/crypto v0.55.0
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f
+	golang.org/x/net v0.58.0
 	golang.org/x/sys v0.47.0
 	gvisor.dev/gvisor v0.0.0-20260224225140-573d5e7127a8
 	tailscale.com v1.103.0-pre.0.20260904030409-31d8badb3bfb
@@ -99,7 +100,6 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	golang.org/x/exp/typeparams v0.0.0-20260209203927-2842357ff358 // indirect
 	golang.org/x/mod v0.38.0 // indirect
-	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/term v0.45.0 // indirect
 	golang.org/x/text v0.41.0 // indirect

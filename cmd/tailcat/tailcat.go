@@ -33,6 +33,7 @@ import (
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffhelp"
 	"github.com/tailscale/tailcat"
+	"github.com/tailscale/tailcat/internal/localhostdns"
 	"go4.org/mem"
 	xmaps "golang.org/x/exp/maps"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -1407,9 +1408,15 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		}
 	}
 
+	// localDialer dials the local services that incoming connections
+	// are proxied to. Its resolver answers "localhost" itself with
+	// both loopback addresses; see the localhostdns package comment
+	// for why the OS resolver can't be trusted to (issue #108).
+	localDialer := &net.Dialer{Resolver: localhostdns.Resolver}
+
 	tcpForwardTo := func(ipPortStr string) func(net.Conn) {
 		return func(c net.Conn) {
-			localConn, err := net.Dial("tcp", ipPortStr)
+			localConn, err := localDialer.Dial("tcp", ipPortStr)
 			if err != nil {
 				logf("error proxying to %v: %v", ipPortStr, err)
 				c.Close()
@@ -1419,9 +1426,28 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		}
 	}
 
+	udpForwardTo := func(dst netip.AddrPort) func(tailcat.ConnPacketConn) {
+		return func(c tailcat.ConnPacketConn) {
+			localConn, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(dst))
+			if err != nil {
+				logf("error proxying to %v: %v", dst, err)
+				c.Close()
+				return
+			}
+			tailcat.ProxyPacketConns(c, localConn)
+		}
+	}
+
 	if services.Contains("exit-node") {
 		s.OnTCPForward = func(dst netip.AddrPort) (handler func(net.Conn)) {
 			return tcpForwardTo(dst.String())
+		}
+		// Exit-node clients send UDP through the tunnel the same way they
+		// send TCP (DNS, QUIC, ...). Without this, those flows are dropped:
+		// the tunnel is up and TCP works, but every UDP flow silently goes
+		// nowhere. See OnUDPForward and ProxyPacketConns in the README.
+		s.OnUDPForward = func(dst netip.AddrPort) (handler func(tailcat.ConnPacketConn)) {
+			return udpForwardTo(dst)
 		}
 	}
 
