@@ -193,9 +193,9 @@ tailcat --endpoint=203.0.113.4:41641 serve --key=exit.key exit-node
 ## 获取与使用
 
 ```bash
-# 1) 取二进制：Releases 里按平台下载（macOS 下解压后可能需要去掉 quarantine 标记）
+# 1) 取二进制：Releases 里按平台下载
 #    https://github.com/zhaoyswd/tailcat/releases  （tag 形如 v0.6.0-udp.N）
-xattr -d com.apple.quarantine ./tailcat   # 仅 macOS
+codesign -s - ./tailcat   # 仅 Apple Silicon 的 macOS（CI 交叉编译无签名，内核会 SIGKILL；去 quarantine 没用）
 
 # 2) 生成一把固定区域的密钥（区域不固定会导致地址随选路漂移）
 tailcat genkey --region=list                 # 看看有哪些区域
