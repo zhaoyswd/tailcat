@@ -1594,6 +1594,10 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		}
 	}
 
+	// 端点提示：首屏地址已按现状打印；这里异步等 STUN/UPnP 观测、按三档判定，
+	// 之后再打一次带提示的地址并重写 TAILCAT_ADDR_FILE（App 构建为空实现）。
+	publishEndpointHints(s, ci, logf)
+
 	if os.Getenv("TAILCAT_STATUS_LOOP") == "1" {
 		go func() {
 			for {

@@ -25,6 +25,10 @@ var wireFieldNames = map[string]string{
 	"q": "PresharedKey",
 	"r": "Region",
 	"i": "RegionID",
+	"e": "EndpointHints",
+	"a": "AddrPort",
+	"T": "Tier",
+	"g": "Generated",
 	"c": "RegionCode",
 	"m": "RegionName",
 	"N": "Nodes",
@@ -56,6 +60,7 @@ func TestWireFieldNames(t *testing.T) {
 		reflect.TypeFor[wireConnInfo](),
 		reflect.TypeFor[wireRegion](),
 		reflect.TypeFor[wireNode](),
+		reflect.TypeFor[wireEndpointHint](),
 	} {
 		for i := range typ.NumField() {
 			f := typ.Field(i)

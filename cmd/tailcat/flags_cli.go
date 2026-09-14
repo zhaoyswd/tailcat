@@ -24,6 +24,8 @@ var (
 	flagAdvertisePort *int
 	flagForwardProxy  *string
 	flagForwardUDP    *string
+	flagEndpointHint  *bool
+	flagEndpoint      *string
 )
 
 // registerExitNodeFlags 由 newRootCommand 调用（App 构建里为空实现）。
@@ -32,6 +34,8 @@ func registerExitNodeFlags(rootFS *ff.FlagSet) {
 	flagAdvertisePort = rootFS.IntLong("advertise-port", envInt("TAILCAT_ADVERTISE_PORT"), "external UDP port to advertise to peers as this node's endpoint, overriding the port discovered via UPnP/STUN. Set it when the router forwards a different external port to --listen-port. The default can also be set with the TAILCAT_ADVERTISE_PORT environment variable")
 	flagForwardProxy = rootFS.StringLong("forward-via-proxy", os.Getenv("TAILCAT_FORWARD_PROXY"), "route the traffic this exit node relays through an upstream proxy, e.g. socks5://127.0.0.1:6153 or http://127.0.0.1:6152. Keeps tailcat's own punch socket direct, which matters when the proxy is a TUN-mode client. The default can also be set with the TAILCAT_FORWARD_PROXY environment variable")
 	flagForwardUDP = rootFS.StringLong("forward-udp", os.Getenv("TAILCAT_FORWARD_UDP"), "how the UDP this exit node relays should use --forward-via-proxy: 'auto' (default) probes the proxy once (SOCKS5 UDP ASSOCIATE + a STUN probe) and uses it when it really relays datagrams; 'on' requires it and exits if it does not; 'off' never proxies UDP. Only socks5:// proxies can carry UDP, and the proxy server itself must support it (Surge does not; mihomo/sing-box/Xray do). The default can also be set with the TAILCAT_FORWARD_UDP environment variable")
+	flagEndpointHint = rootFS.BoolLongDefault("endpoint-hint", true, "bake direct-connect endpoint hints into the tailcat address (a candidate list classified into trusted / best-effort tiers, refreshed after startup once STUN and UPnP results are in), so clients can try them from the first packet instead of waiting for the endpoint advertisement over DERP. Clients that don't know the field ignore it. See also --endpoint.")
+	flagEndpoint = rootFS.StringLong("endpoint", "", "comma-separated ip:port endpoints to append to the address's endpoint hints as manual candidates (marked tier 'manual'), e.g. --endpoint=203.0.113.4:41641,[2606::1]:443. Requires --endpoint-hint (default on). Useful when you know a stable public endpoint the exit itself can't observe.")
 }
 
 // listenPortFlag / advertisePortFlag 供共享的 serve 路径取值（未注册时返回 0）。

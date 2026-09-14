@@ -146,6 +146,36 @@ udp forward -> 1.1.1.1:443 (via socks5://127.0.0.1:1080)      # 每条流自己�
 **代理不支持、可自证**的时候，日志里也会写 `direct(代理不支持 UDP：…)`；**探测本身失败**（连不上代理）
 同样回落直出并把原因写进 `via`。排障可以用 `socks-udp-check.py`（见仓库 docs）。
 
+### 6. 地址端点提示：出口把「直连候选」烤进地址（默认开启，v0.6.0-udp.11 起）
+
+**问题**：客户端能多快走上直连，取决于它**什么时候知道出口的公网端点**。默认要等出口经 DERP 发来
+端点通告（CallMeMaybe）——那一发不重发、还依赖出口的 STUN 已完成，丢一次整段会话可能一直挂在中继上。
+
+**改动**：出口启动后自动观测自身网络（STUN 映射与观测次数、是否随目标变化、本机接口公网 IP、
+UPnP/静态映射端口、外部端口与监听端口是否一致），把**验证过的稳定端点**作为可选字段编进打印的
+地址里（CBOR 键 `e`，向后兼容——官方客户端/老版本会忽略该字段，老地址编码逐字节不变）。客户端
+从第一个包起就有直连候选，探测与经 DERP 的注册**并发**。注册仍走 DERP（那是服务端认识客户端的
+唯一途径），DERP 兜底完整保留。
+
+三档自动判定（无需配置，启动日志一行判据 `endpoint-hint: 档=… v4a=… 端口自洽=… mappedPort=… mapvarydest=… 观测次数=… v6=…`）：
+
+| 档 | 判据 | 处理 |
+|---|---|---|
+| ① 可信 | 显式外部端口（`--advertise-port`）/ UPnP·NAT-PMP·PCP 映射 / 本机网卡就是公网 IP | 写入地址 |
+| ② 尽力 | 锥形 NAT 只有 STUN 临时映射；或全局 IPv6 | 写入并标注 |
+| ③ 剔除 | 对称 NAT；或**钉了 `--listen-port` 而 STUN 端口对不上**（源端口被代理/中间层改写——此时 STUN 报的 IP 也可能是代理出口 IP） | 不写入，地址与官方形态一致 |
+
+地址是**两段式**打印的：启动时先打不含提示的地址（不等异步的 STUN/UPnP），观测齐了再打一次带提示的
+（`# 🐈 Server listening with endpoint hints: …`）并重写 `TAILCAT_ADDR_FILE`。**重启出口后提示串随最新观测
+重算**——key 不变、老地址永远可用，但要拿新提示需重新分发地址。客户端持有 7 天时效，过期候选直接忽略。
+
+```bash
+# 关闭：地址回到无提示形态
+tailcat --endpoint-hint=false serve --key=exit.key exit-node
+# 手动追加候选（出口自己观测不到稳定端点、但你确切知道一个时）：
+tailcat --endpoint=203.0.113.4:41641 serve --key=exit.key exit-node
+```
+
 ---
 
 ## 兼容性与混用
@@ -194,13 +224,14 @@ tailcat --verbose --listen-port=41641 serve --key=exit.key exit-node
 `udp-binaries` 分支已经 **rebase 到上游 `main`**（`tailscale/tailcat`，2026-09-14 同步，基于 v0.6.0 之后的
 4 个提交：`Server.Listen` 库 API、Windows 本地端口修复、我们那份 exit-node UDP 转发补丁、CHANGELOG 更新）。
 所以本 fork 的产物 = 上游 main + 下面列出的少数增量（`--listen-port` / `--advertise-port` / 稳定公网端点通告与
-自动 UPnP / `--forward-via-proxy` / `--forward-udp`），**UDP 转发那段已经回到上游代码**、不再是我们的补丁。
+自动 UPnP / `--forward-via-proxy` / `--forward-udp` / 地址端点提示），**UDP 转发那段已经回到上游代码**、不再是我们的补丁。
 二进制里 `--version` 的 `v0.6.0-N-g<sha>` 就是这个基线的描述。
 
 ### 变更历史（相对官方 v0.6.0）
 
 | 版本 | 变化 |
 |---|---|
+| `v0.6.0-udp.11` | 新增**地址端点提示**（第 6 节）：出口自动观测自身网络、按三档判定把直连候选编进地址（`--endpoint-hint=false` 关、`--endpoint=` 手动追加），客户端从首包起就有直连候选；格式向后兼容（官方客户端忽略新字段） |
 | `v0.6.0-udp.10` | 分支 rebase 到上游 main（含已合并的 exit-node UDP 转发）：产物 = 上游 main + 本 fork 的 5 项增量，代码差异从"一堆补丁"降到 10 个文件；CI 改成只在打 tag / 手动触发时构建 |
 | `v0.6.0-udp.9` | 新增 `--forward-udp`：被转发的 UDP 也能经代理（SOCKS5 UDP ASSOCIATE + 能力探测，`auto` 不支持则回落直出） |
 | `v0.6.0-udp.8` | 代码结构整理（CLI 专用代码移出共享文件，功能同 .7），便于跟上游长期对齐 |

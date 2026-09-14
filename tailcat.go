@@ -182,11 +182,20 @@ type ConnInfo struct {
 
 	// RegionID lists the number of one of Tailscale's provided
 	// DERP servers. If set, Region may be omitted and the tailcat address
-	// is shorter, at the cost of the client needing to fetch
-	// the derpmap from tailscale.com once at startup.
+	// is shorter, at the cost of the client needing to fetch the
+	// derpmap from tailscale.com once at startup.
 	// If -1 (for use when saving a keypair to disk for reuse later), a region
 	// is selected automatically at startup based on latency.
 	RegionID tailcfg.DERPRegionID `json:",omitempty"`
+
+	// EndpointHints, if non-empty, lists direct-connect candidates the
+	// server observed for itself (public IP:port, a confidence tier, and
+	// a generation time), so a client can try them from the first packet
+	// instead of waiting for the server's endpoint advertisement over
+	// DERP. They are a hint, not a promise: registration still goes
+	// through DERP, and clients that know nothing of the field (older or
+	// upstream ones) ignore it. See endpointhint.go.
+	EndpointHints []EndpointHint `json:",omitempty"`
 }
 
 // NodePublic is a wrapper around key.NodePublic just so we can have a slightly
@@ -343,8 +352,14 @@ type locoBackend struct {
 	logf           logger.Logf
 	serverPub      key.NodePublic  // non-zero if we're a client (server's public key)
 	serverDiscoPub key.DiscoPublic // non-zero if we're a client (server's disco key)
-	presharedKey   PresharedKey
-	isServer       bool
+
+	// serverHints 是地址端点提示里**未过期**的直连候选（仅客户端）。
+	// 建 netmap 时填进对端节点的 Endpoints，magicsock 由此从第一个包起就有
+	// 直连候选可探，不必等出口经 DERP 的 CallMeMaybe。过期过滤见
+	// initLocked 与 FreshEndpointHints。
+	serverHints  []netip.AddrPort
+	presharedKey PresharedKey
+	isServer     bool
 	// listenPort / advertisePort 来自 Server 配置（0 = 随机 / 由 UPnP 决定）。
 	listenPort    uint16
 	advertisePort uint16
@@ -369,6 +384,12 @@ type locoBackend struct {
 	allowedClients map[key.NodePublic]bool // or nil map for all
 	eps            []netip.AddrPort        // our current local UDP endpoints, sorted
 	closeOnce      sync.Once
+
+	// advertiseMu 守护 advertiseFailed：直连会话里对端不在 DERP 上，
+	// SendDERPPacketTo 每轮都报 "does not know about peer"。同态失败每个
+	// peer 只记第一次日志、成功后复位，避免出口日志被刷屏。
+	advertiseMu     sync.Mutex
+	advertiseFailed map[key.NodePublic]bool
 }
 
 func (b *locoBackend) derpRegionID() tailcfg.DERPRegionID {
@@ -1087,6 +1108,9 @@ func (ci *ConnInfo) Addr() Addr {
 		}
 		w.Region = append(w.Region, wr)
 	}
+	for _, h := range ci.EndpointHints {
+		w.EndpointHints = append(w.EndpointHints, wireEndpointHintOf(h))
+	}
 
 	x, err := cbor.Marshal(w)
 	if err != nil {
@@ -1184,6 +1208,18 @@ func ParseAddr(addr Addr) (ConnInfo, error) {
 			}
 		}
 		ci.Region = append(ci.Region, wr.derpRegion())
+	}
+	if len(w.EndpointHints) > MaxEndpointHints {
+		return zero, fmt.Errorf("invalid tailcat address: %d endpoint hints (max %d)", len(w.EndpointHints), MaxEndpointHints)
+	}
+	for i, wh := range w.EndpointHints {
+		// Hints are also untrusted input: reject null entries and
+		// unparseable IP:ports instead of probing garbage.
+		h, err := wh.endpointHint()
+		if err != nil {
+			return zero, fmt.Errorf("invalid tailcat address: endpoint hint %d: %v", i, err)
+		}
+		ci.EndpointHints = append(ci.EndpointHints, h)
 	}
 	for ri, r := range ci.Region {
 		if r.RegionID == 0 {
@@ -1630,7 +1666,22 @@ func (b *locoBackend) advertiseEndpoints() {
 		pkt = b.discoPublic().AppendTo(pkt)
 		pkt = append(pkt, discoPriv.Shared(p.DiscoKey()).Seal(payload)...)
 		if _, err := mc.SendDERPPacketTo(p.Key(), regionID, pkt); err != nil {
-			b.logf("advertiseEndpoints to %v: %v", p.Key().ShortString(), err)
+			// 对端完全直连后不在 DERP 上，这是常态而非错误；同态失败
+			// 只记第一次，成功（对端回到 DERP）后复位。
+			b.advertiseMu.Lock()
+			if b.advertiseFailed == nil {
+				b.advertiseFailed = map[key.NodePublic]bool{}
+			}
+			was := b.advertiseFailed[p.Key()]
+			b.advertiseFailed[p.Key()] = true
+			b.advertiseMu.Unlock()
+			if !was {
+				b.logf("advertiseEndpoints to %v: %v（对端已直连、不在 DERP 上时属预期，后续同类失败不再重复）", p.Key().ShortString(), err)
+			}
+		} else {
+			b.advertiseMu.Lock()
+			delete(b.advertiseFailed, p.Key())
+			b.advertiseMu.Unlock()
 		}
 	}
 }
@@ -1706,6 +1757,9 @@ func (lb *locoBackend) Start() error {
 			Addresses:  []netip.Prefix{serverAddrPrefix},
 			AllowedIPs: []netip.Prefix{serverAddrPrefix, allIPv6},
 			HomeDERP:   derpRegion,
+			// 地址端点提示：预置直连候选（updateFromNode 会把它们当作
+			// 普通 netmap 端点去 disco ping，pong 回来即定 bestAddr）。
+			Endpoints: lb.serverHints,
 		}).View())
 	}
 	lb.mu.Lock()
@@ -2001,6 +2055,29 @@ func (c *Client) initLocked() error {
 	lb.dm = &tailcfg.DERPMap{}
 	lb.serverPub = ci.ServerPublic.NodePublic
 	lb.serverDiscoPub = ci.ServerDiscoPublic.DiscoPublic
+
+	// 地址端点提示：把未过期的直连候选提前放进 netmap（探测与经 DERP 的
+	// meow 注册并发；注册仍走 DERP，这里只是让候选早于 CallMeMaybe 就位）。
+	fresh, stale := FreshEndpointHints(ci.EndpointHints, time.Now())
+	for _, h := range fresh {
+		lb.serverHints = append(lb.serverHints, h.AddrPort)
+	}
+	switch {
+	case len(ci.EndpointHints) == 0:
+		logf("connect: no-hint（地址不带端点提示，走完整会合）")
+	case len(fresh) == 0:
+		logf("connect: hint 候选 %d 条全部超 TTL（%.0f 天），跳过探测、走完整会合", len(ci.EndpointHints), EndpointHintTTL.Hours()/24)
+	default:
+		var tiers string
+		for _, h := range fresh {
+			tiers += " " + EndpointHintTierName(h.Tier)
+		}
+		if stale > 0 {
+			logf("connect: hint 候选 %d 条（%s；另有 %d 条超 TTL 跳过），探测与注册并发", len(fresh), tiers, stale)
+		} else {
+			logf("connect: hint 候选 %d 条（%s），探测与注册并发", len(fresh), tiers)
+		}
+	}
 
 	sys := &lb.sys
 	bus := eventbus.New()

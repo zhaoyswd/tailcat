@@ -4,6 +4,10 @@
 package tailcat
 
 import (
+	"errors"
+	"fmt"
+	"net/netip"
+
 	"tailscale.com/tailcfg"
 )
 
@@ -24,11 +28,29 @@ import (
 
 // wireConnInfo is the wire form of [ConnInfo].
 type wireConnInfo struct {
-	ServerPublic      NodePublic    `cbor:"p" json:"ServerPublic"`
-	ServerDiscoPublic *DiscoPublic  `cbor:"k,omitempty" json:"ServerDiscoPublic,omitempty"`
-	PresharedKey      *PresharedKey `cbor:"q,omitempty" json:"PresharedKey,omitempty"`
-	Region            []*wireRegion `cbor:"r,omitempty" json:"Region,omitempty"`
-	RegionID          int64         `cbor:"i,omitempty" json:"RegionID,omitempty"`
+	ServerPublic      NodePublic          `cbor:"p" json:"ServerPublic"`
+	ServerDiscoPublic *DiscoPublic        `cbor:"k,omitempty" json:"ServerDiscoPublic,omitempty"`
+	PresharedKey      *PresharedKey       `cbor:"q,omitempty" json:"PresharedKey,omitempty"`
+	Region            []*wireRegion       `cbor:"r,omitempty" json:"Region,omitempty"`
+	RegionID          int64               `cbor:"i,omitempty" json:"RegionID,omitempty"`
+	EndpointHints     []*wireEndpointHint `cbor:"e,omitempty" json:"EndpointHints,omitempty"`
+}
+
+// wireEndpointHint is the wire form of [EndpointHint]: a direct-connect
+// candidate for the server, as observed by the server itself. The wire
+// AddrPort uses netip.AddrPort's string form ("1.2.3.4:443" or
+// "[2606::1]:443").
+type wireEndpointHint struct {
+	// AddrPort is the candidate's public IP and port.
+	AddrPort string `cbor:"a" json:"AddrPort"`
+
+	// Tier is the server's confidence in the candidate (see the
+	// EndpointHintTier* constants): 1 trusted, 2 best-effort, 3 manual.
+	Tier int `cbor:"T" json:"Tier"`
+
+	// Generated is when the server observed the candidate, as unix
+	// seconds. Zero means unknown; clients treat it as fresh.
+	Generated int64 `cbor:"g,omitempty" json:"Generated,omitempty"`
 }
 
 // wireRegion is the wire form of [tailcfg.DERPRegion].
@@ -57,6 +79,32 @@ type wireNode struct {
 	STUNPort         int    `cbor:"s,omitempty" json:"STUNPort,omitempty"`
 	DERPPort         int    `cbor:"d,omitempty" json:"DERPPort,omitempty"`
 	InsecureForTests bool   `cbor:"x,omitempty" json:"InsecureForTests,omitempty"`
+}
+
+// wireEndpointHintOf converts an [EndpointHint] to its wire form.
+func wireEndpointHintOf(h EndpointHint) *wireEndpointHint {
+	return &wireEndpointHint{
+		AddrPort:  h.AddrPort.String(),
+		Tier:      h.Tier,
+		Generated: h.Generated,
+	}
+}
+
+// endpointHint converts w back to an [EndpointHint]. The AddrPort string
+// comes from untrusted input (a pasted address), so parse errors are
+// reported rather than silently dropped.
+func (w *wireEndpointHint) endpointHint() (EndpointHint, error) {
+	if w == nil {
+		return EndpointHint{}, errors.New("null endpoint hint")
+	}
+	ap, err := netip.ParseAddrPort(w.AddrPort)
+	if err != nil {
+		return EndpointHint{}, fmt.Errorf("invalid endpoint hint %q: %w", w.AddrPort, err)
+	}
+	if !ap.IsValid() || w.Tier == 0 {
+		return EndpointHint{}, fmt.Errorf("invalid endpoint hint %q: bad tier or address", w.AddrPort)
+	}
+	return EndpointHint{AddrPort: ap, Tier: w.Tier, Generated: w.Generated}, nil
 }
 
 // wireRegionOf converts a [tailcfg.DERPRegion] (such as one from the
