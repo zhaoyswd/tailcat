@@ -209,3 +209,26 @@ func TestEndpointClassifyPrivateOrCGNATExcluded(t *testing.T) {
 		t.Errorf("tsaddr CGNAT range sanity")
 	}
 }
+
+// TestPublishEndpointHintsDisabledAnnouncesPlain 锁住单次打印契约的禁用分支：
+// --endpoint-hint=false 时必须**立即** announce 原版地址（一次、不带提示）。
+func TestPublishEndpointHintsDisabledAnnouncesPlain(t *testing.T) {
+	flagEndpointHint = new(bool) // false
+	ci := &tailcat.ConnInfo{RegionID: 304}
+	plain := ci.Addr()
+	got := make(chan tailcat.Addr, 2)
+	publishEndpointHints(nil, ci, plain, func(string, ...any) {}, func(a tailcat.Addr) { got <- a })
+	select {
+	case a := <-got:
+		if a != plain {
+			t.Errorf("announced %v; want plain %v", a, plain)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("disabled path did not announce")
+	}
+	select {
+	case a := <-got:
+		t.Errorf("announced twice: %v", a)
+	case <-time.After(300 * time.Millisecond):
+	}
+}

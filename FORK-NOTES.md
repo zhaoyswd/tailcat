@@ -233,6 +233,7 @@ tailcat --verbose --listen-port=41641 serve --key=exit.key exit-node
 
 | 版本 | 变化 |
 |---|---|
+| `v0.6.0-udp.12` | 地址改**单次打印**：分档验证完成前不发地址，之后恰好一条（有提示打提示版，没有就打原版形态）——替代 udp.11 的两段式（两条 token 容易拿错）；`--endpoint-hint=false` 立即打原版 |
 | `v0.6.0-udp.11` | 新增**地址端点提示**（第 6 节）：出口自动观测自身网络、按三档判定把直连候选编进地址（`--endpoint-hint=false` 关、`--endpoint=` 手动追加），客户端从首包起就有直连候选；格式向后兼容（官方客户端忽略新字段） |
 | `v0.6.0-udp.10` | 分支 rebase 到上游 main（含已合并的 exit-node UDP 转发）：产物 = 上游 main + 本 fork 的 5 项增量，代码差异从"一堆补丁"降到 10 个文件；CI 改成只在打 tag / 手动触发时构建 |
 | `v0.6.0-udp.9` | 新增 `--forward-udp`：被转发的 UDP 也能经代理（SOCKS5 UDP ASSOCIATE + 能力探测，`auto` 不支持则回落直出） |

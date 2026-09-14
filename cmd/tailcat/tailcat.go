@@ -1571,32 +1571,35 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	if *flagKey == "new" {
-		fmt.Fprintf(os.Stderr, "# 🐈 Server listening with new address: %v\n", connStr)
-	} else {
-		fmt.Fprintf(os.Stderr, "# 🐈 Server listening with saved key %q: %v\n", *flagKey, connStr)
-	}
-	if *flagJSON {
-		json.NewEncoder(os.Stdout).Encode(map[string]string{"listenAddr": string(connStr)})
-	}
-	if v := os.Getenv("TAILCAT_ADDR_FILE"); v != "" {
-		if tcpAddr, ok := strings.CutPrefix(v, "tcp:"); ok {
-			c, err := net.Dial("tcp", tcpAddr)
-			if err != nil {
-				log.Fatalf("TAILCAT_ADDR_FILE tcp dial %q: %v", tcpAddr, err)
-			}
-			fmt.Fprintln(c, connStr)
-			c.Close()
+	// 地址只打一次（2026-09-15 起单次打印，替代原先的两段式）：分档验证完成前不发任何
+	// 地址——有提示打提示版，没有提示（③档全剔除 / 无观测 / --endpoint-hint=false）打
+	// 原版形态。announce 统一负责 stderr 行、--json 的 stdout 与 TAILCAT_ADDR_FILE，
+	// 于是操作者永远只会看到一个 token，不会再拿错。
+	announce := func(addr tailcat.Addr) {
+		if *flagKey == "new" {
+			fmt.Fprintf(os.Stderr, "# 🐈 Server listening with new address: %v\n", addr)
 		} else {
-			if err := os.WriteFile(v, []byte(connStr), 0600); err != nil {
-				log.Fatal(err)
+			fmt.Fprintf(os.Stderr, "# 🐈 Server listening with saved key %q: %v\n", *flagKey, addr)
+		}
+		if *flagJSON {
+			json.NewEncoder(os.Stdout).Encode(map[string]string{"listenAddr": string(addr)})
+		}
+		if v := os.Getenv("TAILCAT_ADDR_FILE"); v != "" {
+			if tcpAddr, ok := strings.CutPrefix(v, "tcp:"); ok {
+				c, err := net.Dial("tcp", tcpAddr)
+				if err != nil {
+					log.Fatalf("TAILCAT_ADDR_FILE tcp dial %q: %v", tcpAddr, err)
+				}
+				fmt.Fprintln(c, addr)
+				c.Close()
+			} else {
+				if err := os.WriteFile(v, []byte(addr), 0600); err != nil {
+					log.Fatal(err)
+				}
 			}
 		}
 	}
-
-	// 端点提示：首屏地址已按现状打印；这里异步等 STUN/UPnP 观测、按三档判定，
-	// 之后再打一次带提示的地址并重写 TAILCAT_ADDR_FILE（App 构建为空实现）。
-	publishEndpointHints(s, ci, logf)
+	publishEndpointHints(s, ci, connStr, logf, announce)
 
 	if os.Getenv("TAILCAT_STATUS_LOOP") == "1" {
 		go func() {

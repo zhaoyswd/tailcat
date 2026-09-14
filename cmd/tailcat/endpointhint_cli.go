@@ -9,8 +9,9 @@
 //  2. 按三档判定：① 可信（本机即公网 / 有路由器映射 / 显式声明外部端口）→ 写入；
 //     ② 尽力而为（锥形 NAT 的 STUN 临时映射 / 全局 IPv6）→ 写入并标注；
 //     ③ 不可信（对称 NAT、源端口被中间层改写）→ 不写入；
-//  3. 两段式打印：首屏地址保持现状（不等异步的 STUN/UPnP），分档验证完成后再打
-//     一次带提示的地址并重写 TAILCAT_ADDR_FILE。
+//  3. 单次地址打印（2026-09-15 起替代两段式）：分档验证完成前不发任何地址，
+//     然后 announce 一次最终地址——有提示打提示版，没有就打原版形态；stderr 行、
+//     --json 与 TAILCAT_ADDR_FILE 都由共享侧的 announce 闭包统一负责。
 //
 // 诚实边界：本地只能判「映射是否可信」，判不了「入站过滤是否开放」——最终裁决
 // 是客户端的有界探测（探测与会合并发，全错时代价只是几个无效探测包）。
@@ -20,7 +21,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -40,11 +40,13 @@ const (
 )
 
 // publishEndpointHints 由 serve 的共享路径调用（App 构建为空实现）：
-// 等待观测就绪 → 分档判定 → 打档位日志行 → 打印带提示地址并重写 TAILCAT_ADDR_FILE。
-// ci 是本次 serve 用来生成首屏地址的同一个 ConnInfo（只读借用，本协程内追加提示）。
-func publishEndpointHints(s *tailcat.Server, ci *tailcat.ConnInfo, logf func(string, ...any)) {
+// 等待观测就绪 → 分档判定 → 打档位日志行 → announce 一次最终地址（带提示或原版形态）。
+// ci 是本次 serve 用来生成首屏地址的同一个 ConnInfo（只读借用，本协程内追加提示）；
+// plainAddr 是不含提示的地址（③档全剔除/无观测/--endpoint-hint=false 时 announce 它）。
+func publishEndpointHints(s *tailcat.Server, ci *tailcat.ConnInfo, plainAddr tailcat.Addr, logf func(string, ...any), announce func(tailcat.Addr)) {
 	if !endpointHintEnabled() {
 		logf("endpoint-hint: 已按 --endpoint-hint=false 禁用，地址不带端点提示")
+		announce(plainAddr)
 		return
 	}
 	go func() {
@@ -53,19 +55,11 @@ func publishEndpointHints(s *tailcat.Server, ci *tailcat.ConnInfo, logf func(str
 		hints, basis := endpointClassify(obs, localPublicAddrs(), manual, time.Now())
 		logf("endpoint-hint: %s", basis)
 		if len(hints) == 0 {
+			announce(plainAddr)
 			return
 		}
 		ci.EndpointHints = hints
-		addr := ci.Addr()
-		fmt.Fprintf(os.Stderr, "# 🐈 Server listening with endpoint hints: %v\n", addr)
-		if v := os.Getenv("TAILCAT_ADDR_FILE"); v != "" {
-			// tcp: 形态是一次性投递（首屏已写过），这里只重写文件形态。
-			if !strings.HasPrefix(v, "tcp:") {
-				if err := os.WriteFile(v, []byte(addr), 0600); err != nil {
-					logf("endpoint-hint: 重写 TAILCAT_ADDR_FILE: %v", err)
-				}
-			}
-		}
+		announce(ci.Addr())
 	}()
 }
 
