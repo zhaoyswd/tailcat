@@ -195,8 +195,7 @@ tailcat --endpoint=203.0.113.4:41641 serve --key=exit.key exit-node
 ```bash
 # 1) 取二进制：Releases 里按平台下载（curl/wget 下载的 macOS 产物解压即跑，
 #    Go 链接器自动打了 ad-hoc 签名；浏览器下载的去 quarantine：
-#    xattr -d com.apple.quarantine ./tailcat。极小概率首次运行被 SIGKILL 时
-#    `codesign -s - ./tailcat` 重签即可）
+#    xattr -d com.apple.quarantine ./tailcat）
 #    https://github.com/zhaoyswd/tailcat/releases  （tag 形如 v0.6.0-udp.N）
 
 # 2) 生成一把固定区域的密钥（区域不固定会导致地址随选路漂移）
