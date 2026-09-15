@@ -1389,6 +1389,7 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	if p := advertisePortFlag(); p > 0 && p < 65536 {
 		s.AdvertiseUDPPort = uint16(p)
 	}
+	s.BindInterface = bindInterfaceFlag()
 	sshServices := services.Contains("ssh") || services.Contains("no-auth-ssh") || services.Contains("files")
 	if sshServices && !tailcat.SupportsSSHServer() {
 		log.Fatalf("Tailscale SSH server not supported on %v", runtime.GOOS)

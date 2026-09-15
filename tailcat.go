@@ -464,6 +464,18 @@ type Server struct {
 	// Set it when the router forwards a different external port to ListenPort.
 	AdvertiseUDPPort uint16
 
+	// BindInterface controls binding the exit's own sockets (magicsock UDP
+	// and DERP TCP, via netns) to a physical network interface, so they
+	// egress directly instead of being captured and re-originated by a
+	// same-host TUN-type proxy (which rewrites source ports and breaks
+	// direct connections; see AGENTS 坑 29). Values: "" or "off" (default,
+	// do nothing), "physical" (probe-verify candidate interfaces with DNS
+	// anycast probes and bind the winner; falls back to unbound when no
+	// candidate passes), or an explicit interface name (pinned, but still
+	// probe-verified). It must be set before calling Start. See
+	// egressbind.go.
+	BindInterface string
+
 	// Logf is the logger used for debug messages.
 	// If nil, log.Printf is used.
 	Logf logger.Logf
@@ -686,6 +698,8 @@ func (s *Server) startLocked(ctx context.Context) error {
 
 	lb.isServer = true
 	lb.listenPort = s.ListenPort
+	// 物理上行绑定：初始评估必须在 createEngine 之前同步完成（决定 netns 开关与解析）。
+	startEgressBind(lb, s.BindInterface)
 	lb.advertisePort = s.AdvertiseUDPPort
 	lb.onDERPRecv = func(regionID tailcfg.DERPRegionID, src key.NodePublic, pkt []byte) bool {
 		if !IsMeowPacket(pkt) {
@@ -1953,7 +1967,11 @@ func createEngine(logf logger.Logf, lb *locoBackend) (err error) {
 	// call-me-maybe messages that advertise our UDP endpoints (see
 	// locoBackend.advertiseEndpoints).
 	conf.ForceDiscoKey = discoPrivateForNode(lb.priv)
-	netns.SetEnabled(false)
+	// 物理上行绑定生效时保持 netns 启用（magicsock UDP 与 DERP TCP 由此绑定到解析出的接口）；
+	// 否则维持历史行为：进程级关闭（客户端无 TUN 可避、netns 回退坑 loopback netcheck）。
+	if !egressBindActive() {
+		netns.SetEnabled(false)
+	}
 	e, err := wgengine.NewUserspaceEngine(logf, conf)
 	if err != nil {
 		logf("wgengine.NewUserspaceEngine(tun %q) error: %v", "userspace-networking", err)

@@ -146,6 +146,33 @@ udp forward -> 1.1.1.1:443 (via socks5://127.0.0.1:1080)      # 每条流自己�
 **代理不支持、可自证**的时候，日志里也会写 `direct(代理不支持 UDP：…)`；**探测本身失败**（连不上代理）
 同样回落直出并把原因写进 `via`。排障可以用 `socks-udp-check.py`（见仓库 docs）。
 
+### 7. `--bind-interface`：出口自己的流量绑物理网卡，绕开同机 TUN 型代理（v0.6.0-udp.13 起，默认关）
+
+**问题**：出口主机上跑着 TUN 型代理（Surge 增强模式、clash/sing-box tun 等）时，代理把 utun 设为
+全局默认路由，未绑定 socket 的 UDP 会被代理**用它自己的 socket 重发**——对端看到的源端口与 IP
+都不是你的 ⇒ STUN 学到代理的映射、打洞永远建不起来，双方只能走中继。
+
+**用法**：
+
+```bash
+tailcat --listen-port=41641 --bind-interface=physical serve --key=exit.key exit-node   # 自动探测绑定
+tailcat --bind-interface=en0 serve …        # 钉死指定网卡（仍会先探测验证）
+# 默认 off（什么都不做）；环境变量 TAILCAT_BIND_PROBE_DNS 可覆盖探针目标
+```
+
+**机制**：候选物理网卡逐个「绑定后向公共 anycast DNS（223.5.5.5/119.29.29.29/1.1.1.1）发探测」
+验证——应答必须事务 ID 匹配**且**来源等于所查服务器（路由器劫持 :53 代答不算）；赢家落地后
+macOS 用 `IP_BOUND_IF`、Linux 用 `SO_BINDTODEVICE`（需 CAP_NET_RAW）把打洞 UDP 与 DERP TCP
+一起钉到该网卡。**全不通 = 保持现状不绑定**（绝不因此起不来）；换网/网卡拔插自动重评估
+（30 秒粘性窗口防抖）。判据日志一行：
+`bind-interface: physical → en0（目标=…:53,… 候选[en0:13ms] 解析=en0）`，其后 netcheck 的
+`v4a` 应等于 `<真实公网IP>:<监听端口>`。
+
+**平台差异**：macOS 完整支持（含多网卡时按探测 + netmon 解析选优）；Linux 的绑定目标取
+netmon 的默认路由解析、探测只做验证门控（无重定向旋钮），且需 root/CAP_NET_RAW。
+实测（macOS + Surge 增强模式开）：绑定后 `v4a` 从 `<代理IP>:<随机端口>` 变为
+`114.242.60.128:<监听端口>`——蜂窝直连恢复。
+
 ### 6. 地址端点提示：出口把「直连候选」烤进地址（默认开启，v0.6.0-udp.11 起）
 
 **问题**：客户端能多快走上直连，取决于它**什么时候知道出口的公网端点**。默认要等出口经 DERP 发来
@@ -232,6 +259,7 @@ tailcat --verbose --listen-port=41641 serve --key=exit.key exit-node
 
 | 版本 | 变化 |
 |---|---|
+| `v0.6.0-udp.13` | 新增 **`--bind-interface`（出口物理上行绑定，默认 off）**：第 7 节——`physical` 用 DNS anycast 探针逐候选验证后把出口自己的 socket（打洞 UDP + DERP TCP）绑到物理网卡，绕开同机 TUN 型代理的源端口改写 |
 | `v0.6.0-udp.12` | 地址改**单次打印**：分档验证完成前不发地址，之后恰好一条（有提示打提示版，没有就打原版形态）——替代 udp.11 的两段式（两条 token 容易拿错）；`--endpoint-hint=false` 立即打原版 |
 | `v0.6.0-udp.11` | 新增**地址端点提示**（第 6 节）：出口自动观测自身网络、按三档判定把直连候选编进地址（`--endpoint-hint=false` 关、`--endpoint=` 手动追加），客户端从首包起就有直连候选；格式向后兼容（官方客户端忽略新字段） |
 | `v0.6.0-udp.10` | 分支 rebase 到上游 main（含已合并的 exit-node UDP 转发）：产物 = 上游 main + 本 fork 的 5 项增量，代码差异从"一堆补丁"降到 10 个文件；CI 改成只在打 tag / 手动触发时构建 |
