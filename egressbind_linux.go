@@ -8,6 +8,7 @@ package tailcat
 import (
 	"fmt"
 	"net"
+	"os"
 
 	"golang.org/x/sys/unix"
 )
@@ -20,3 +21,9 @@ func bindFDtoInterfaceImpl(fd int, network, ifName string) error {
 }
 
 var _ = net.InterfaceByName // 保持 net 引用（与其它平台文件对齐）
+
+// pinNetmonDefaultRoute：Linux 无此旋钮（绑定目标=netmon 默认路由解析，探针只做验证门控）。
+func pinNetmonDefaultRoute(ifName string) {}
+
+// forceBindToDevice 让 netns 的 controlC 走 SO_BINDTODEVICE 而非 SO_MARK。
+func forceBindToDevice() { _ = os.Setenv("TS_FORCE_LINUX_BIND_TO_DEVICE", "1") }

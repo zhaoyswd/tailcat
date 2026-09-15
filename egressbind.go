@@ -26,13 +26,11 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
 )
@@ -178,18 +176,6 @@ func probeTargets() []netip.AddrPort {
 // Linux（SO_BINDTODEVICE）见 egressbind_linux.go，其余平台见 egressbind_other.go。
 func bindFDtoInterface(fd int, network, ifName string) error {
 	return bindFDtoInterfaceImpl(fd, network, ifName)
-}
-
-// bindFDtoInterfaceDarwin 是 darwin 的绑定实现（IP_BOUND_IF / IPV6_BOUND_IF）。
-func bindFDtoInterfaceImpl(fd int, network, ifName string) error {
-	ifc, err := net.InterfaceByName(ifName)
-	if err != nil {
-		return fmt.Errorf("interface %q: %w", ifName, err)
-	}
-	if strings.Contains(network, "6") {
-		return unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_BOUND_IF, ifc.Index)
-	}
-	return unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_BOUND_IF, ifc.Index)
 }
 
 // probeCandidate 对单个候选建 UDP socket、绑定后发探针。返回 RTT 与结论。
@@ -428,17 +414,9 @@ func applyBindDecision(lb *locoBackend, winner, basis string) {
 	if cur == winner {
 		return // 无变化
 	}
-	switch runtime.GOOS {
-	case "darwin":
-		// OSDefaultRoute 优选读这个值 ⇒ 钉住 netns 的解析（空串撤不掉，解绑走 SetEnabled(false)）。
-		netmon.UpdateLastKnownDefaultRouteInterface(winner)
-	case "linux":
-		// netns 的 controlC 默认走 SO_MARK（不绑接口）；强制走 SO_BINDTODEVICE。
-		// 必须在 netns 首次读该 env 之前设置（初始评估在 createEngine 之前完成，满足）。
-		if os.Getenv("TS_FORCE_LINUX_BIND_TO_DEVICE") == "" {
-			_ = os.Setenv("TS_FORCE_LINUX_BIND_TO_DEVICE", "1")
-		}
-	}
+	// darwin：钉住 netns 的解析（OSDefaultRoute 优选读这个值；空串撤不掉，解绑走 SetEnabled(false)）。
+	pinNetmonDefaultRoute(winner)
+	forceBindToDevice()
 	setEgressBind(winner)
 	netns.SetEnabled(true)
 	lb.logf("bind-interface: physical → %s（%s）", winner, basis)

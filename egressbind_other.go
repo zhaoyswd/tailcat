@@ -8,3 +8,8 @@ import "fmt"
 func bindFDtoInterfaceImpl(fd int, network, ifName string) error {
 	return fmt.Errorf("egress bind: 平台不支持")
 }
+
+func pinNetmonDefaultRoute(ifName string) {}
+
+// forceBindToDevice：仅 Linux 有实际动作（设 TS_FORCE_LINUX_BIND_TO_DEVICE=1）。
+func forceBindToDevice() {}
