@@ -1392,6 +1392,15 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	if err := setupForwarding(reg); err != nil {
 		log.Fatal(err)
 	}
+	// Agent-gateway（tier App 的 opencode/codex 远程会话翻译层）：常驻回环监听、按需拉起
+	// 后端，全部实现在 agentgateway*.go 独立文件；失败不影响 serve。
+	// filesRoot 用于把 App 传来的 files 服务 SFTP 沙箱路径换算成宿主绝对路径
+	//（os.Root 不暴露根位置，只有同进程的我们知道）。
+	gwFilesRoot := ""
+	if fs, _, ferr := parseFilesFlag(*flagFiles); ferr == nil && fs != nil {
+		gwFilesRoot = fs.Dir
+	}
+	go startAgentGateway(logger.WithPrefix(logf, "[agent-gateway] "), gwFilesRoot)
 	s := &tailcat.Server{Key: priv, PresharedKey: psk, DisablePresharedKey: !usePSK, Logf: logf, Region: reg}
 	if p := listenPortFlag(); p > 0 && p < 65536 {
 		s.ListenPort = uint16(p)
