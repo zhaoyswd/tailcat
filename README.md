@@ -43,83 +43,21 @@ support ([#4](https://github.com/tailscale/tailcat/issues/4)).
 
 ## Install
 
-Prebuilt binaries are on the
-[Releases page](https://github.com/tailscale/tailcat/releases): static
-Linux binaries (tar.gz) plus Debian (.deb) and RPM (.rpm) packages for
-amd64, arm64, and armv7, and Windows binaries (zip) for amd64 and
-arm64.
+See [INSTALL.md](./INSTALL.md) for details on each, including notes
+for packagers building from source:
 
-There's also a
-[container image](https://github.com/tailscale/tailcat/pkgs/container/tailcat):
-
-```sh
-$ docker pull ghcr.io/tailscale/tailcat:v0.1.0  # or :latest
-$ docker run --rm -it ghcr.io/tailscale/tailcat:latest
-```
-
-For macOS, install with [Homebrew](https://brew.sh/):
-
-```sh
-$ brew install tailcat
-```
-
-Or build from source with a Go toolchain:
-
-```sh
-$ go install github.com/tailscale/tailcat/cmd/tailcat@latest
-```
-
-Or with Nix, from [nixpkgs](https://search.nixos.org/packages?channel=unstable&query=tailcat):
-
-```sh
-$ nix profile install nixpkgs#tailcat
-$ nix-env -iA nixpkgs.tailcat  # or with classic nix-env
-```
-
-Or with Nix flakes from this repo, run it directly or install it:
-
-```sh
-$ nix run github:tailscale/tailcat
-$ nix profile install github:tailscale/tailcat
-```
-
-Or from archlinux AUR:
-
-[![tailcat on AUR](https://img.shields.io/aur/version/tailcat?label=tailcat)](https://aur.archlinux.org/packages/tailcat/)
-[![tailcat-bin on AUR](https://img.shields.io/aur/version/tailcat-bin?label=tailcat-bin)](https://aur.archlinux.org/packages/tailcat-bin/)
-
-```bash
-# Build release package from source
-yay -S tailcat
-
-# OR install the binary release
-yay -S tailcat-bin
-```
-
-Or from conda-forge:
-
-[![tailcat on conda-forge](https://img.shields.io/conda/vn/conda-forge/tailcat?logo=conda-forge)](https://prefix.dev/channels/conda-forge/packages/tailcat)
-[![tailcat on conda-forge](https://img.shields.io/conda/pn/conda-forge/tailcat?logo=conda-forge)](https://prefix.dev/channels/conda-forge/packages/tailcat)
-
-```bash
-pixi global install tailcat
-# run without installation
-pixi exec tailcat
-```
-
-### Packaging from source
-
-The official binaries are built with a list of build tags that omits
-unused Tailscale features, making them about 16% smaller. The
-recommended tag list is checked in as
-[build-tags.txt](./build-tags.txt) (and kept accurate by a CI test),
-so packagers (Homebrew, AUR, NixOS, etc.) can build the same way:
-
-```sh
-$ go build -tags "$(cat build-tags.txt)" -ldflags "-s -w" ./cmd/tailcat
-```
-
-See [build-tags.md](./build-tags.md) for the details.
+| Method | Linux | macOS | Windows | FreeBSD,<br>OpenBSD | Browser<br>(js/wasm) |
+|--------|:-----:|:-----:|:-------:|:-------------------:|:--------------------:|
+| [Static binaries](INSTALL.md#prebuilt-binaries) | ✅ | | ✅ | | |
+| [.deb packages](INSTALL.md#prebuilt-binaries) | Debian, Ubuntu, ... | | | | |
+| [.rpm packages](INSTALL.md#prebuilt-binaries) | Red Hat, Fedora, ... | | | | |
+| [Homebrew](INSTALL.md#homebrew-macos) | | ✅ | | | |
+| [Scoop](INSTALL.md#scoop-windows) | | | ✅ | | |
+| [Container image](INSTALL.md#container-image) | ✅ | | | | |
+| [Nix](INSTALL.md#nix) | ✅ | ✅ | | | |
+| [AUR](INSTALL.md#arch-linux-aur) | Arch | | | | |
+| [conda-forge](INSTALL.md#conda-forge) | ✅ | ✅ | ✅ | | |
+| [Build from source](INSTALL.md#go-toolchain) | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ## Usage
 

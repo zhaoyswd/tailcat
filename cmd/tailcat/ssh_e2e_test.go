@@ -43,17 +43,11 @@ func TestServeNoAuthSSH(t *testing.T) {
 	_, addr, stderr := e.startServer("--serve=no-auth-ssh")
 	waitForLog(t, stderr, "# ⚠️ WARNING: no-auth-ssh gives a shell to anyone with this address; keep it secret (never in a DNS TXT record) or restrict clients with --allow\n")
 
-	client := e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, "ssh", addr, "echo", "hi")
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-done:
-		case <-time.After(30 * time.Second):
-			client.Process.Kill()
-		}
-	}()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	client := exec.CommandContext(ctx, e.bin, "--key=new", "--derpmap-url="+e.derpMapURL, "ssh", addr, "echo", "hi")
+	client.Env = e.env
 	out, err := client.CombinedOutput()
-	close(done)
 	if err != nil {
 		t.Fatalf("tailcat ssh: %v\n%s", err, out)
 	}
