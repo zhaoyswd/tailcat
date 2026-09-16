@@ -168,10 +168,13 @@ func newAGOC(logf logger.Logf) *agOC {
 	if u == "" {
 		u = "http://127.0.0.1:4096"
 	}
+	// hc 硬禁代理：即使出口环境有 HTTP_PROXY 等变量，到本机 opencode 的回环调用
+	// 也绝不被代理走（默认 Transport 会读环境变量；codex/opencode 严格限定本机）。
+	noProxyTransport := &http.Transport{Proxy: nil}
 	return &agOC{
 		url:       strings.TrimRight(u, "/"),
 		logf:      logf,
-		hc:        &http.Client{Timeout: 30 * time.Second},
+		hc:        &http.Client{Timeout: 30 * time.Second, Transport: noProxyTransport},
 		out:       make(chan agNtfOut, 256),
 		statuses:  map[string]string{},
 		dirs:      map[string]string{},
