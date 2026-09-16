@@ -13,9 +13,11 @@ import (
 	"tailscale.com/tstest/integration"
 )
 
-// TestDirectMinimal — 直连握手先行的最小闭环：Server 带 ListenPort 钉死、
-// 客户端只靠手动 hint 候选（无 meow 预注册）以 WireGuard-only 形态直发
-// 握手 + TSMP 就绪探测。成功即证明懒注册 + wgonly + 回程索引全链工作。
+// TestDirectMinimal — 直连优先建连的最小闭环：Server 带 ListenPort 钉死、
+// 客户端用手动 hint 候选（loopback，无开发机环境依赖）走 Ready()（App
+// 的真实入口）。断言 readyBy 有值 = 赛跑就绪路径真的执行过（Ready 的
+// 第一版判据在 ensureStarted 之前、App 路径永远走不到直连分支，被
+// review 揪出——本测试的 readyBy 断言就是防它回归）。
 func TestDirectMinimal(t *testing.T) {
 	t.Parallel()
 	dm := integration.RunDERPAndSTUN(t, log.Printf, "127.0.0.1")
@@ -36,7 +38,7 @@ func TestDirectMinimal(t *testing.T) {
 		t.Fatal(err)
 	}
 	ci.EndpointHints = []EndpointHint{{
-		AddrPort:  netipMustAddrPort("192.168.3.12:41633"),
+		AddrPort:  netipMustAddrPort("127.0.0.1:41633"),
 		Tier:      EndpointHintManual,
 		Generated: time.Now().Unix(),
 	}}
@@ -46,6 +48,16 @@ func TestDirectMinimal(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	rctx, rcancel := context.WithTimeout(context.Background(), 15*time.Second)
+	by, rerr := c.Ready(rctx) // App 的真实就绪入口
+	rcancel()
+	if rerr != nil {
+		t.Fatalf("Ready: %v", rerr)
+	}
+	if by != "direct" && by != "meow" {
+		t.Fatalf("readyBy = %q; want direct|meow（空 = Ready 没走赛跑路径，回归！）", by)
+	}
+	t.Logf("readyBy=%s", by)
 	const payload = "direct-min-echo"
 	conn, err := c.DialTCPPort(ctx, 80)
 	if err != nil {

@@ -1,18 +1,22 @@
 // directconnect.go — 客户端直连优先建连（openspec change
 // direct-handshake-connect）。
 //
-// 机制（2026-09-16 实测定稿）：地址带未过期端点候选且 DirectConnect 开启时，
-// 建连不再以 meowed 为同步门槛——meow 转后台异步补注册，dial 立即开始，
-// WireGuard 握手由服务端懒注册（peerConfig 放行）承接（不依赖 meow 到达，
-// 经 DERP 或既有路径完成），数据面先行。meow 完成后服务端拿到本机 disco key
-// 注册，此时主动发一次 disco ping 把候选端点变成 bestAddr，数据面切直连。
-// TSMP 探测作为就绪探针（WG 加密层，不依赖 disco）；多次未成则回落现状
-// meow 同步会合（官方服务端上这是必然路径）。
+// 机制（2026-09-17 按 review 修订定稿）：地址带未过期候选（hint 或学习
+// 端点）且 DirectConnect 开启时，就绪不再以 meowed 为串行门槛——TSMP
+// 探针与后台 meow **赛跑**，谁先成功谁就算就绪：
+//   - 服务端懒注册（peerConfig 放行）让 WireGuard 握手不依赖 meow 先行
+//     到达，探针（握手隐含在首个出站包里 + TSMP 往返）可在 meow 之前完成；
+//   - 官方（无懒注册的）服务端上探针握手被丢，meow 赢得赛跑——**不多付
+//     任何等待**（旧实现顺序探测 3×1s 再回落，官方出口白等 3s，已修）；
+//   - meow 完成后服务端拿到本机 disco key 注册，kickDisco 立刻促直连
+//     切换（hint 候选经 disco pong 成为 bestAddr）。
 //
-// 已知边界：WireGuard-only peer 形态（握手与数据从第一个包起直发候选、零
-// DERP 接触）在 magicsock/wireguard-go 深处存在未定位的握手静默失败
-// （实验：直发 initiation 到达服务端 UDP 但握手不成，回落后一切正常），
-// 暂不启用；本文件的结构（探测/回落/异步注册）为其保留了接入点。
+// 已知边界（诚实声明）：非 WireGuard-only peer 的**首个握手包本身走 DERP**
+// （magicsock addrForSendLocked 对无 bestAddr 的普通 peer 只给 derpAddr），
+// 所以 DERP 完全不可达时握手与 meow 一起失败——「DERP 不可用即连不上」
+// 没有被本 change 解决；实际收益是「就绪不再串行多等一个中继往返 +
+// 注册后立刻促直连」。零中继首跳的 WireGuard-only 形态在 wireguard-go
+// 深处存在未定位的握手静默失败，未启用（现象记录见 PATCHES §2.8）。
 package tailcat
 
 import (
@@ -24,48 +28,98 @@ import (
 	"tailscale.com/tailcfg"
 )
 
-// 直连就绪探测预算：单次尝试 1s（握手经 DERP 时 2×RTT + TSMP 1×RTT，
-// 本机/直连 <100ms、中继 <2.5s——失败重试覆盖丢包）。
+// 直连就绪探测预算。注意蜂窝中继路径 RTT 600–750ms，1s 的单次窗口对
+// 「握手 2×RTT + TSMP 1×RTT」并不宽裕——首次尝试超时是预期内的情况，
+// 靠重试兜底；赛跑的另一条腿（meow）通常在官方出口上更快到达。
 const (
 	directProbeAttempt  = time.Second
 	directProbeAttempts = 3
 )
 
-// meow 后台补注册的重试节奏（b2 形态：成功使出口获得本机 disco key 注册
-// 与 CallMeMaybe 通告通道；失败不影响懒注册数据面）。
+// meow 后台补注册的节奏与预算（b2 形态）。
 const (
 	meowBgAttempts = 3
 	meowBgInterval = time.Second
 	meowBgBudget   = 15 * time.Second
 )
 
-// PingDirect 是直连优先模式的就绪探测：并发启动 meow 后台补注册，然后
-// 以 TSMP ping 探测握手是否完成；成功即就绪。全部尝试失败则回落现状
-// meow 同步会合并按其判据就绪（与未开启直连时一致）。
+// PingDirect 是直连优先模式的就绪探测：后台 meow 与 TSMP 探针赛跑，
+// 谁先成功谁就算就绪。探针全败且 meow 在预算内也没到，则等 meow 到
+// 调用方 ctx 到点为止（回落语义与旧路径「无条件等 meowed」一致）。
 func (c *Client) PingDirect(ctx context.Context) error {
 	if err := c.ensureStarted(ctx); err != nil {
 		return err
 	}
-	go c.meowBackground()
-	for range directProbeAttempts {
-		if err := c.probeTSMP(ctx); err == nil {
-			c.upDone.Store(true)
-			return nil
-		}
+	by, err := c.raceReady(ctx)
+	if err == nil {
+		c.readyByVal.Store(by)
+		c.upDone.Store(true)
 	}
-	c.lb.logf("connect: hint-miss→derp（直连探测 %d×%v 未成，回落 meow 会合）", directProbeAttempts, directProbeAttempt)
-	_, err := c.Ping(ctx)
 	return err
 }
 
 // Ready 按当前模式执行就绪探测：直连优先模式走 PingDirect，否则走现状
-// meow 会合（Client.Ping）。tunmode 暖机与状态机统一经此入口。
-func (c *Client) Ready(ctx context.Context) error {
-	if c.lb != nil && c.lb.directFirst.Load() {
-		return c.PingDirect(ctx)
+// meow 会合（Client.Ping）。返回就绪判据（"direct"/"meow"，供诊断）。
+//
+// ⚠️ 必须先 ensureStarted 再判模式（与 up() 同一条铁律）：首次调用时
+// c.lb 还没建（initLocked 在 ensureStarted 里跑、directFirst 也是那时才
+// 置位），先判断会永远走普通路径——本函数第一版犯过这个错并被 review
+// 揪出（App 路径上新模式从未执行过）。
+func (c *Client) Ready(ctx context.Context) (readyBy string, err error) {
+	if err := c.ensureStarted(ctx); err != nil {
+		return "", err
 	}
-	_, err := c.Ping(ctx)
-	return err
+	if c.lb.directFirst.Load() {
+		if err := c.PingDirect(ctx); err != nil {
+			return "", err
+		}
+		return c.readyBy(), nil
+	}
+	_, err = c.Ping(ctx)
+	if err == nil {
+		c.readyByVal.Store("meow")
+	}
+	return c.readyBy(), err
+}
+
+// readyBy returns the recorded readiness basis ("" before first success).
+func (c *Client) readyBy() string {
+	if v, ok := c.readyByVal.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+// raceReady runs the TSMP probe attempts against the background meow
+// registration; first success wins. If the probe exhausts its attempts and
+// meow hasn't landed either, it keeps waiting on meowWait until the parent
+// context is done.
+func (c *Client) raceReady(ctx context.Context) (string, error) {
+	c.startMeowBackground()
+	for range directProbeAttempts {
+		select {
+		case <-c.meowWait:
+			return "meow", nil
+		default:
+		}
+		if err := c.probeTSMP(ctx); err == nil {
+			return "direct", nil
+		}
+		select {
+		case <-c.meowWait:
+			return "meow", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(directProbeAttempt):
+		}
+	}
+	c.lb.logf("connect: hint-miss→meow（直连探测 %d×%v 未成，等 meow 会合）", directProbeAttempts, directProbeAttempt)
+	select {
+	case <-c.meowWait:
+		return "meow", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 }
 
 // probeTSMP sends one TSMP ping through the tunnel to the server's tailcat
@@ -99,12 +153,24 @@ func (c *Client) probeTSMP(parent context.Context) error {
 	}
 }
 
+// startMeowBackground launches the async meow registration with an in-flight
+// latch: failures don't latch meowedOnce, but a Dial storm must not spawn
+// parallel 15s-budget goroutines (one at a time).
+func (c *Client) startMeowBackground() {
+	if c.meowedOnce.Load() || !c.meowInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer c.meowInFlight.Store(false)
+		c.meowBackground()
+	}()
+}
+
 // meowBackground performs the async meow registration (b2): a few bounded
-// retries, result logged only. On success the server has our disco key in
-// b.clients (its peerByIP fast path + CallMeMaybe announcements), and we
-// immediately kick one disco ping so the hint candidates can become bestAddr
-// and the data plane switches to the direct path without waiting for
-// magicsock's own discovery cadence.
+// retries, result logged only. Exits early when the client is closed (bgDone)
+// so it never outlives its generation (AGENTS 坑 26/26b 的世代教训).
+// On success it does NOT call advertiseEndpoints: the client's onMeowed
+// callback (initLocked) already does — 旧版这里重复调过一次（review 指出）。
 func (c *Client) meowBackground() {
 	if c.meowedOnce.Load() {
 		return
@@ -112,17 +178,22 @@ func (c *Client) meowBackground() {
 	ctx, cancel := context.WithTimeout(context.Background(), meowBgBudget)
 	defer cancel()
 	for range meowBgAttempts {
+		select {
+		case <-c.bgDone:
+			return
+		default:
+		}
 		if _, err := c.ping(ctx); err == nil {
 			c.meowedOnce.Store(true)
-			// meowed 到达即满足现状的就绪语义，置 upDone 让后续 up/DiscoPing
-			// 直接放行，不再重跑探测（kickDisco 的 DiscoPing 也会经 up）。
+			// meowed 到达即满足旧路径的就绪语义（赛跑的另一条腿在等它）。
 			c.upDone.Store(true)
-			c.lb.logf("connect: meow 注册完成（出口动态通告通道就绪，促直连切换）")
-			c.lb.advertiseEndpoints()
+			c.lb.logf("connect: meow 注册完成（出口动态通告通道就绪）")
 			go c.kickDisco()
 			return
 		}
 		select {
+		case <-c.bgDone:
+			return
 		case <-ctx.Done():
 			c.lb.logf("connect: meow 异步注册未成（预算耗尽），懒注册数据面不受影响")
 			return
@@ -132,13 +203,22 @@ func (c *Client) meowBackground() {
 	c.lb.logf("connect: meow 异步注册未成（DERP 不可达或出口无响应），懒注册数据面不受影响")
 }
 
-// kickDisco sends one disco ping to the server (via the normal magicsock
-// path) to promote hint candidates to bestAddr right after registration,
-// instead of waiting for the next outbound packet to trigger discovery.
+// kickDisco sends one disco ping to the server so hint candidates can become
+// bestAddr right after registration, without waiting for magicsock's own
+// discovery cadence. Bounded and generation-safe.
 func (c *Client) kickDisco() {
+	select {
+	case <-c.bgDone:
+		return
+	default:
+	}
 	dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer dcancel()
 	if _, err := c.DiscoPing(dctx); err != nil {
-		c.lb.logf("connect: meow 后促直连的 disco ping 未成（%v），交由常规节奏", err)
+		select {
+		case <-c.bgDone:
+		default:
+			c.lb.logf("connect: meow 后促直连的 disco ping 未成（%v），交由常规节奏", err)
+		}
 	}
 }

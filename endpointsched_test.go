@@ -10,76 +10,37 @@ func schedHint(ap string, tier int) EndpointHint {
 	return EndpointHint{AddrPort: netip.MustParseAddrPort(ap), Tier: tier, Generated: time.Now().Unix()}
 }
 
-func aps(list ...string) (out []netip.AddrPort) {
-	for _, s := range list {
-		out = append(out, netip.MustParseAddrPort(s))
+func TestFilterHintsCellularDropsPrivate(t *testing.T) {
+	hints := []EndpointHint{
+		schedHint("192.168.3.12:41641", EndpointHintLAN),
+		schedHint("114.242.60.128:41641", EndpointHintTrusted),
+		schedHint("[2606:4700::1]:41641", EndpointHintBestEffort),
+		schedHint("100.64.5.5:41641", EndpointHintLAN), // CGNAT 也算私网
 	}
-	return
-}
-
-func eqAPs(t *testing.T, got []netip.AddrPort, want []string) {
-	t.Helper()
-	w := aps(want...)
-	if len(got) != len(w) {
-		t.Fatalf("got %v; want %v", got, w)
+	learned := []netip.AddrPort{netip.MustParseAddrPort("192.168.3.12:41699")}
+	keep, dropped := FilterHints(learned, hints, "cellular")
+	if len(dropped) != 3 || dropped[0].String() != "192.168.3.12:41699" || dropped[1].String() != "192.168.3.12:41641" || dropped[2].String() != "100.64.5.5:41641" {
+		t.Fatalf("dropped = %v; want learned-LAN + hint-LAN + hint-CGNAT", dropped)
 	}
-	for i := range got {
-		if got[i] != w[i] {
-			t.Fatalf("got %v; want %v", got, w)
+	if len(keep) != 2 {
+		t.Fatalf("keep = %v", keep)
+	}
+	for _, ap := range keep {
+		if ap.Addr().IsPrivate() {
+			t.Errorf("private %v survived cellular filter", ap)
 		}
 	}
 }
 
-func TestSortEndpointsCellular(t *testing.T) {
+func TestFilterHintsNonCellularKeepsAll(t *testing.T) {
 	hints := []EndpointHint{
 		schedHint("192.168.3.12:41641", EndpointHintLAN),
 		schedHint("114.242.60.128:41641", EndpointHintTrusted),
-		schedHint("[2606:4700::1]:41641", EndpointHintBestEffort),
 	}
-	ordered, filtered := SortEndpoints(nil, hints, LocalNetInfo{Bearer: "cellular"})
-	eqAPs(t, filtered, []string{"192.168.3.12:41641"})
-	eqAPs(t, ordered, []string{"[2606:4700::1]:41641", "114.242.60.128:41641"})
-}
-
-func TestSortEndpointsWifiSamePrefix(t *testing.T) {
-	hints := []EndpointHint{
-		schedHint("114.242.60.128:41641", EndpointHintTrusted),
-		schedHint("192.168.3.12:41641", EndpointHintLAN),
-		schedHint("192.168.9.9:41641", EndpointHintLAN),
+	for _, bearer := range []string{"wifi", "", "unknown"} {
+		keep, dropped := FilterHints(nil, hints, bearer)
+		if len(keep) != 2 || len(dropped) != 0 {
+			t.Fatalf("bearer=%q: keep=%v dropped=%v; want all kept (conservative)", bearer, keep, dropped)
+		}
 	}
-	local := []netip.Prefix{netip.MustParsePrefix("192.168.3.99/24")}
-	ordered, filtered := SortEndpoints(nil, hints, LocalNetInfo{Bearer: "wifi", Addrs: local})
-	if len(filtered) != 0 {
-		t.Fatalf("wifi filtered %v; want none", filtered)
-	}
-	// 同网段 LAN 最优先，公网按原序，异网段私网殿后。
-	eqAPs(t, ordered, []string{"192.168.3.12:41641", "114.242.60.128:41641", "192.168.9.9:41641"})
-}
-
-func TestSortEndpointsLearnedFirst(t *testing.T) {
-	hints := []EndpointHint{schedHint("114.242.60.128:41641", EndpointHintTrusted)}
-	learned := aps("114.242.60.128:56016") // 端口漂移后学到的
-	ordered, _ := SortEndpoints(learned, hints, LocalNetInfo{Bearer: "cellular"})
-	eqAPs(t, ordered, []string{"114.242.60.128:56016", "114.242.60.128:41641"})
-}
-
-func TestSortEndpointsUnknownBearerConservative(t *testing.T) {
-	hints := []EndpointHint{
-		schedHint("114.242.60.128:41641", EndpointHintTrusted),
-		schedHint("192.168.3.12:41641", EndpointHintLAN),
-		schedHint("[2606:4700::1]:41641", EndpointHintBestEffort),
-	}
-	ordered, filtered := SortEndpoints(nil, hints, LocalNetInfo{})
-	if len(filtered) != 0 {
-		t.Fatalf("unknown bearer filtered %v; want none", filtered)
-	}
-	if len(ordered) != 3 {
-		t.Fatalf("got %v", ordered)
-	}
-}
-
-func TestSortEndpointsCGNATIsPrivate(t *testing.T) {
-	hints := []EndpointHint{schedHint("100.64.5.5:41641", EndpointHintLAN)}
-	_, filtered := SortEndpoints(nil, hints, LocalNetInfo{Bearer: "cellular"})
-	eqAPs(t, filtered, []string{"100.64.5.5:41641"})
 }

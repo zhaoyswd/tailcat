@@ -1,14 +1,12 @@
-// endpointsched.go — 建连候选的网络感知排序与过滤（openspec change
+// endpointsched.go — 建连候选的网络感知过滤（openspec change
 // direct-handshake-connect）。纯函数、无网络依赖、单测覆盖。
 //
-// 规则（判据缺失时保守：不过滤、不重排）：
-//   - 蜂窝：丢弃私网候选（RFC1918/CGNAT/链路本地——必然不可达，向运营商
-//     内网发探测既浪费也留指纹）；全局 IPv6 优先于公网 IPv4。
-//   - Wi-Fi：与手机当前接口地址**同网段**的私网候选最高优先（回家场景：
-//     手机与出口同 LAN，一跳直达）；其余私网殿后（不同网段的 Wi-Fi 上
-//     不可达，但「握手成功即止」模型下只在前面的都失败后才被试到）；
-//     公网候选保持原序。
-//   - 学习端点（端点学习缓存）始终排在全部候选之前（最新、最可能命中）。
+// 2026-09-17 按 review 大幅简化：只保留「蜂窝丢弃私网候选」（必然不可
+// 达，向运营商内网发探测既浪费也留指纹；学习端点一起过同样的滤——旧
+// 版把 learned 无条件放最前、绕过了私网过滤，在家学到 LAN 端点后切蜂窝
+// 仍会去探，是自相矛盾）。排序整体删除：候选全部进入 netmap 的
+// Endpoints 后 magicsock 是**并发探测**的，谁先 pong 谁赢，顺序不改变
+// 探测并发度与结果；"Wi-Fi 同网段最优先/v6 优先"的收益无法兑现。
 package tailcat
 
 import (
@@ -17,74 +15,40 @@ import (
 	"tailscale.com/net/tsaddr"
 )
 
-// LocalNetInfo 是调用方（扩展 net observer）传入的手机网络上下文。
-// Bearer 为 "cellular"/"wifi"（其它值=未知，保守处理）；Addrs 为手机
-// 当前接口地址（含前缀长度，用于同网段判断）。
-type LocalNetInfo struct {
-	Bearer string
-	Addrs  []netip.Prefix
+// FilterHints 过滤建连候选：bearer 为 "cellular" 时丢弃私网候选
+// （RFC1918/CGNAT/链路本地，含学习端点），其余情况原样保留（判据缺失
+// 时保守不过滤）。返回保留列表与被丢弃列表（诊断日志用）。
+func FilterHints(learned []netip.AddrPort, hints []EndpointHint, bearer string) (keep, dropped []netip.AddrPort) {
+	dropLAN := bearer == "cellular"
+	for _, ap := range learned {
+		if !ap.IsValid() {
+			continue
+		}
+		if dropLAN && isLanCandidate(ap) {
+			dropped = append(dropped, ap)
+			continue
+		}
+		keep = append(keep, ap)
+	}
+	for _, h := range hints {
+		if !h.AddrPort.IsValid() {
+			continue
+		}
+		if dropLAN && isLanCandidate(h.AddrPort) {
+			dropped = append(dropped, h.AddrPort)
+			continue
+		}
+		keep = append(keep, h.AddrPort)
+	}
+	return keep, dropped
 }
 
 // isLanCandidate reports whether ap is a private (same-LAN-only) candidate:
 // RFC1918 or CGNAT space. Link-local is treated as private too (unusable
-// off-link).
+// off-link). 已知边界：host-network 容器/EIP-NAT 主机会把内网地址采成
+// ④LAN 候选（对客户端不可达）——过滤只认地址类别不认「是不是真的同
+// LAN」，残留候选的代价是多一次无效探测，无正确性影响。
 func isLanCandidate(ap netip.AddrPort) bool {
 	a := ap.Addr().Unmap()
 	return a.IsPrivate() || a.IsLinkLocalUnicast() || tsaddr.CGNATRange().Contains(a)
-}
-
-// samePrefix reports whether addr falls inside one of the phone's current
-// interface prefixes.
-func samePrefix(addr netip.Addr, local []netip.Prefix) bool {
-	addr = addr.Unmap()
-	for _, p := range local {
-		if p.Contains(addr) {
-			return true
-		}
-	}
-	return false
-}
-
-// SortEndpoints orders and filters the connect candidates for the current
-// phone network. learned (endpoint-learning cache, most recent first) always
-// comes first; hints follow the rules above. filteredOut is returned for
-// diagnostics (the scheduler logs what it dropped and why).
-func SortEndpoints(learned []netip.AddrPort, hints []EndpointHint, net LocalNetInfo) (ordered, filteredOut []netip.AddrPort) {
-	var v6, v4pub, lanSame, lanOther []netip.AddrPort
-
-	for _, h := range hints {
-		ap := h.AddrPort
-		if !ap.IsValid() {
-			continue
-		}
-		lan := isLanCandidate(ap)
-		switch {
-		case net.Bearer == "cellular" && lan:
-			filteredOut = append(filteredOut, ap) // 蜂窝：私网必然不可达
-		case lan && samePrefix(ap.Addr(), net.Addrs):
-			lanSame = append(lanSame, ap) // Wi-Fi 同网段：一跳直达
-		case lan:
-			lanOther = append(lanOther, ap) // 其余私网殿后
-		case ap.Addr().Is6():
-			v6 = append(v6, ap)
-		default:
-			v4pub = append(v4pub, ap)
-		}
-	}
-
-	var public []netip.AddrPort
-	switch {
-	case net.Bearer == "cellular":
-		public = append(v6, v4pub...) // 蜂窝：v6 NAT-free 优先
-	case net.Bearer == "wifi":
-		public = append(v4pub, v6...) // Wi-Fi：保持生成端原序（v4 在前）
-	default:
-		public = append(v4pub, v6...) // 判据缺失：保守原序
-	}
-
-	ordered = append(ordered, learned...)
-	ordered = append(ordered, lanSame...)
-	ordered = append(ordered, public...)
-	ordered = append(ordered, lanOther...)
-	return ordered, filteredOut
 }

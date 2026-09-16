@@ -1779,14 +1779,6 @@ func (b *locoBackend) advertiseEndpoints() {
 	}
 }
 
-// firstFew returns up to three AddrPorts for compact logging.
-func firstFew(aps []netip.AddrPort) []netip.AddrPort {
-	if len(aps) > 3 {
-		aps = aps[:3]
-	}
-	return aps
-}
-
 // nodeHasAddr reports whether ip is one of n's tailcat addresses.
 func nodeHasAddr(n tailcfg.NodeView, ip netip.Addr) bool {
 	if !n.Valid() {
@@ -2117,10 +2109,21 @@ type Client struct {
 	// 之前参与调度。存储由调用方（tunmode）负责，库只消费。
 	LearnedEndpoints []netip.AddrPort
 
-	// NetInfo 是建连时的手机网络上下文（承载类型 + 当前接口前缀），
-	// 供网络感知候选调度（SortEndpoints）使用；nil = 判据缺失，保守
-	// 地不排序不过滤。必须在首次使用前设置。
-	NetInfo *LocalNetInfo
+	// NetBearer 是建连时的手机网络承载类型（"cellular"/"wifi"/""），供
+	// 候选过滤（蜂窝丢弃私网候选）使用；空 = 判据缺失，不过滤。必须
+	// 在首次使用前设置。
+	NetBearer string
+
+	// bgDone 在 Client.Close 时关闭，供 meowBackground/kickDisco 等后台
+	// goroutine 退出，不跨世代存活（坑 26/26b 的教训）。
+	bgDone chan struct{}
+
+	// meowInFlight 是后台 meow 注册的在飞闩锁（失败不闩 meowedOnce，
+	// 但同一时刻只允许一个注册 goroutine）。
+	meowInFlight atomic.Bool
+
+	// readyByVal 记录最近一次就绪的判据（"direct"/"meow"），诊断用。
+	readyByVal atomic.Value // string
 
 	lb       *locoBackend
 	ci       ConnInfo      // of server
@@ -2162,6 +2165,9 @@ func NewClient(server Addr) *Client {
 // does no network access; that happens in ensureStarted, its caller.
 // c.startMu must be held.
 func (c *Client) initLocked() error {
+	if c.bgDone == nil {
+		c.bgDone = make(chan struct{})
+	}
 	if c.lb != nil {
 		return nil
 	}
@@ -2185,16 +2191,13 @@ func (c *Client) initLocked() error {
 	// 地址端点提示：把未过期的直连候选提前放进 netmap（探测与经 DERP 的
 	// meow 注册并发；注册仍走 DERP，这里只是让候选早于 CallMeMaybe 就位）。
 	fresh, stale := FreshEndpointHints(ci.EndpointHints, time.Now())
-	// 网络感知调度：蜂窝滤私网/优 v6、Wi-Fi 同网段最优先（纯函数，
-	// 见 endpointsched.go）。判据缺失时保守原序。
-	var netInfo LocalNetInfo
-	if c.NetInfo != nil {
-		netInfo = *c.NetInfo
-	}
-	scheduled, schedFiltered := SortEndpoints(c.LearnedEndpoints, fresh, netInfo)
+	// 候选过滤（endpointsched.go）：蜂窝丢弃私网候选（必然不可达，向
+	// 运营商内网发探测既浪费也留指纹）；学习端点一起过同样的滤。
+	// 排序已删（review：候选都进 netmap 后 magicsock 并发探测，顺序无意义）。
+	scheduled, schedFiltered := FilterHints(c.LearnedEndpoints, fresh, c.NetBearer)
 	lb.serverHints = scheduled
 	if len(schedFiltered) > 0 {
-		logf("connect: 调度 bearer=%q 滤除=%v 先试=%v", netInfo.Bearer, schedFiltered, firstFew(scheduled))
+		logf("connect: 调度 bearer=%q 滤除私网候选 %v", c.NetBearer, schedFiltered)
 	}
 	switch {
 	case len(ci.EndpointHints) == 0:
@@ -2213,9 +2216,11 @@ func (c *Client) initLocked() error {
 		}
 	}
 
-	if c.DirectConnect && len(fresh) > 0 {
+	// 学习端点单独就能开启直连模式（hint 全过期/为空但缓存新鲜 = 端口
+	// 漂移 + 老 token 的目标场景，review 指出旧判据漏了它）。
+	if c.DirectConnect && (len(fresh) > 0 || len(c.LearnedEndpoints) > 0) {
 		lb.directFirst.Store(true)
-		logf("connect: direct-first（握手先行 + meow 异步注册，候选 %d 条；探测未成回落会合）", len(fresh))
+		logf("connect: direct-first（探针与 meow 赛跑就绪，hint 候选 %d + 学习端点 %d）", len(fresh), len(c.LearnedEndpoints))
 	}
 
 	sys := &lb.sys
@@ -2304,18 +2309,6 @@ func (c *Client) initLocked() error {
 	return nil
 }
 
-// ServerPublicKey returns the server's node public key from the parsed
-// address. The client must have been started (ensureStarted/Ping/Dial).
-// It identifies the endpoint-learning cache file for this server.
-func (c *Client) ServerPublicKey() key.NodePublic {
-	c.startMu.Lock()
-	defer c.startMu.Unlock()
-	if c.ci.ServerPublic.IsZero() {
-		return key.NodePublic{}
-	}
-	return c.ci.ServerPublic.NodePublic
-}
-
 // PublicKey returns the client's node public key, generating the key
 // first if the Key field is zero and the client hasn't yet been used.
 func (c *Client) PublicKey() key.NodePublic {
@@ -2328,6 +2321,13 @@ func (c *Client) PublicKey() key.NodePublic {
 func (c *Client) Close() error {
 	c.startMu.Lock()
 	defer c.startMu.Unlock()
+	if c.bgDone != nil {
+		select {
+		case <-c.bgDone:
+		default:
+			close(c.bgDone) // 后台 meow/kickDisco 收工，不跨世代存活
+		}
+	}
 	if c.lb == nil {
 		return nil // never used
 	}
