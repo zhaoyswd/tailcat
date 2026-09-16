@@ -141,7 +141,7 @@ func newRootCommand() *ff.Command {
 			{
 				Name:      "serve",
 				Usage:     "tailcat serve [flags] [<port,service,...> ...] [-- <command> [args...]]",
-				ShortHelp: "run a server (the default when tailcat is run with no arguments)",
+				ShortHelp: "run a server (exit-node,files by default in this fork)",
 				LongHelp:  serveLongHelp,
 				Flags:     serveFS,
 				Exec: func(ctx context.Context, args []string) error {
@@ -152,6 +152,13 @@ func newRootCommand() *ff.Command {
 							return usagef("use either --serve or positional port/service arguments, not both")
 						}
 						spec = strings.Join(args, ",")
+					}
+					// 本 fork 的默认服务（2026-09-16）：出口 + 文件服务。只在 serve 子命令这层
+					// 兜底——server() 的另两个调用点不能被波及：recv 故意传空 spec（靠 --files
+					// 隐含 files 实现投递盒），裸 `tailcat`（根命令路径）是 one-shot 管道模式
+					// （vanilla 核心用法）。显式给服务/端口列表则按输入执行，与官方语义一致。
+					if spec == "" {
+						spec = "exit-node,files"
 					}
 					server(getLogf(), spec, execArgs)
 					return nil
@@ -423,8 +430,7 @@ Environment:
 	TAILCAT_DERPMAP_URL: the default value of the --derpmap-url flag.`
 
 const serveLongHelp = `Run a tailcat server, printing its tailcat address for clients to
-connect to. Running tailcat with no arguments is the same as running
-"tailcat serve" with no arguments.
+connect to.
 
 The arguments are port numbers, port ranges, and service names,
 either as separate arguments or comma-separated. Ports are proxied
@@ -445,8 +451,12 @@ to the same port on localhost. Service names are:
 	             the connection as the command's stdin and stdout
 	             (like inetd); its stderr is the server's
 
-With no arguments, the server accepts a single connection on any
-port, writes it to stdout, and exits.
+With no arguments, the server serves exit-node,files: an exit node
+plus the file server for the current directory, read-only (this
+differs from upstream, where no arguments means one-shot stdout
+mode; in this fork that mode is only reachable by running tailcat
+with no subcommand at all). Giving --files overrides the served
+directory and mode.
 
 A command after "--" implies the exec service, unless the ssh or
 no-auth-ssh service is also given: then SSH sessions run only that
