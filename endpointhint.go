@@ -34,6 +34,13 @@ const (
 
 	// EndpointHintManual (③ 手动): user-specified via --endpoint.
 	EndpointHintManual = 3
+
+	// EndpointHintLAN (④ 局域网): an RFC1918 address on one of the
+	// server's physical interfaces. Only meaningful to a client on the
+	// same LAN (the phone-at-home case); the client's network-aware
+	// scheduling decides whether to use it — cellular clients filter it
+	// out entirely.
+	EndpointHintLAN = 4
 )
 
 // MaxEndpointHints caps how many hints an address may carry, so a
@@ -98,6 +105,8 @@ func EndpointHintTierName(tier int) string {
 		return "②尽力"
 	case EndpointHintManual:
 		return "③手动"
+	case EndpointHintLAN:
+		return "④LAN"
 	}
 	return "未知"
 }

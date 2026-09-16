@@ -27,6 +27,7 @@ var (
 	flagForwardUDP    *string
 	flagEndpointHint  *bool
 	flagEndpoint      *string
+	flagDirectConnect *bool
 	flagBindInterface *string
 )
 
@@ -36,6 +37,8 @@ func registerExitNodeFlags(rootFS *ff.FlagSet) {
 	flagAdvertisePort = rootFS.IntLong("advertise-port", envInt("TAILCAT_ADVERTISE_PORT"), "external UDP port to advertise to peers as this node's endpoint, overriding the port discovered via UPnP/STUN. Set it when the router forwards a different external port to --listen-port. The default can also be set with the TAILCAT_ADVERTISE_PORT environment variable")
 	flagForwardProxy = rootFS.StringLong("forward-via-proxy", os.Getenv("TAILCAT_FORWARD_PROXY"), "route the traffic this exit node relays through an upstream proxy, e.g. socks5://127.0.0.1:6153 or http://127.0.0.1:6152. Keeps tailcat's own punch socket direct, which matters when the proxy is a TUN-mode client. The default can also be set with the TAILCAT_FORWARD_PROXY environment variable")
 	flagForwardUDP = rootFS.StringLong("forward-udp", os.Getenv("TAILCAT_FORWARD_UDP"), "how the UDP this exit node relays should use --forward-via-proxy: 'auto' (default) probes the proxy once (SOCKS5 UDP ASSOCIATE + a STUN probe) and uses it when it really relays datagrams; 'on' requires it and exits if it does not; 'off' never proxies UDP. Only socks5:// proxies can carry UDP, and the proxy server itself must support it (Surge does not; mihomo/sing-box/Xray do). The default can also be set with the TAILCAT_FORWARD_UDP environment variable")
+	flagDirectConnect = rootFS.BoolLongDefault("direct-connect", false, `enable direct-handshake-first connect (openspec direct-handshake-connect): when the address carries endpoint hints, the server peer is set up as WireGuard-only so handshakes and data go straight to the candidate endpoints (no disco, no DERP), with a TSMP readiness probe and fallback to the full DERP rendezvous when it fails. Off by default; the tier app enables it via its hidden switch.`)
+
 	flagEndpointHint = rootFS.BoolLongDefault("endpoint-hint", true, "bake direct-connect endpoint hints into the tailcat address (a candidate list classified into trusted / best-effort tiers, refreshed after startup once STUN and UPnP results are in), so clients can try them from the first packet instead of waiting for the endpoint advertisement over DERP. Clients that don't know the field ignore it. See also --endpoint.")
 	flagBindInterface = rootFS.StringLong("bind-interface", "off", "bind the exit's own sockets (punch UDP and DERP TCP) to a physical network interface so they egress directly instead of being captured and re-originated by a same-host TUN-type proxy (which rewrites source ports and breaks direct connections). 'off' (default) does nothing; 'physical' probe-verifies candidate interfaces with DNS anycast probes and binds the winner (falls back to unbound if none passes); an explicit interface name pins it (still probe-verified). macOS: IP_BOUND_IF, Linux: SO_BINDTODEVICE (needs CAP_NET_RAW).")
 	flagEndpoint = rootFS.StringLong("endpoint", "", "comma-separated ip:port endpoints to append to the address's endpoint hints as manual candidates (marked tier 'manual'), e.g. --endpoint=203.0.113.4:41641,[2606::1]:443. Requires --endpoint-hint (default on). Useful when you know a stable public endpoint the exit itself can't observe.")

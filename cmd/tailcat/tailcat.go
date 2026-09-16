@@ -817,13 +817,17 @@ func clientKey() key.NodePrivate {
 // newClient returns a [tailcat.Client] configured with the global
 // --derpmap-url flag and the disk DERP map cache.
 func newClient(logf logger.Logf, addr tailcat.Addr, priv key.NodePrivate) *tailcat.Client {
-	return &tailcat.Client{
+	cl := &tailcat.Client{
 		Server:       addr,
 		Key:          priv,
 		Logf:         logf,
 		DERPMapURL:   *flagDERPMapURL,
 		DERPMapCache: derpMapCache{},
 	}
+	if flagDirectConnect != nil && *flagDirectConnect {
+		cl.DirectConnect = true
+	}
+	return cl
 }
 
 // derpMapCache implements [tailcat.DERPMapCache] on disk, in

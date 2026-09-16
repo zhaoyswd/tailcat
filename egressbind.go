@@ -51,6 +51,12 @@ var virtualIfPrefixes = []string{
 	"bridge", "vmenet", "docker", "virbr", "veth", "br-", "ap",
 }
 
+// IsVirtualInterface reports whether name looks like a virtual interface
+// (loopback/tun/bridge/docker/…), per the egressbind candidate blacklist.
+// Exported for the endpoint-hint LAN collector, which must skip virtual
+// interfaces so container bridges don't leak into addresses as LAN hints.
+func IsVirtualInterface(name string) bool { return isVirtualInterface(name) }
+
 func isVirtualInterface(name string) bool {
 	for _, p := range virtualIfPrefixes {
 		if strings.HasPrefix(name, p) {

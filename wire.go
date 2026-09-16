@@ -45,7 +45,8 @@ type wireEndpointHint struct {
 	AddrPort string `cbor:"a" json:"AddrPort"`
 
 	// Tier is the server's confidence in the candidate (see the
-	// EndpointHintTier* constants): 1 trusted, 2 best-effort, 3 manual.
+	// EndpointHintTier* constants): 1 trusted, 2 best-effort, 3 manual,
+	// 4 LAN (same-subnet clients only).
 	Tier int `cbor:"T" json:"Tier"`
 
 	// Generated is when the server observed the candidate, as unix

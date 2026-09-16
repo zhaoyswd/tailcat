@@ -353,6 +353,12 @@ type locoBackend struct {
 	serverPub      key.NodePublic  // non-zero if we're a client (server's public key)
 	serverDiscoPub key.DiscoPublic // non-zero if we're a client (server's disco key)
 
+	// directFirst（仅客户端）：直连优先建连模式（openspec
+	// direct-handshake-connect）：meow 转后台异步、就绪判据是 TSMP 探测
+	// （WireGuard 握手经 server 懒注册放行，不依赖 meow 到达）、meow 完成
+	// 后主动 disco 促直连切换。见 directconnect.go。
+	directFirst atomic.Bool
+
 	// serverHints 是地址端点提示里**未过期**的直连候选（仅客户端）。
 	// 建 netmap 时填进对端节点的 Endpoints，magicsock 由此从第一个包起就有
 	// 直连候选可探，不必等出口经 DERP 的 CallMeMaybe。过期过滤见
@@ -390,7 +396,28 @@ type locoBackend struct {
 	// peer 只记第一次日志、成功后复位，避免出口日志被刷屏。
 	advertiseMu     sync.Mutex
 	advertiseFailed map[key.NodePublic]bool
+
+	// lazyPeers（服务端懒注册，openspec direct-handshake-connect）：
+	// peerConfig 对未知 key 放行时记 (tcAddr→key) 索引，peerByIP miss
+	// clients 时兜底回程路由——meow 注册到达前直连握手的数据面就能工作；
+	// meow 完成后 b.clients 主路径接管。凭据验证由 WG 握手的 IK+PSK 完成，
+	// 未完成握手的懒 peer 被 wireguard-go 按 RejectAfterTime*3 自回收。
+	lazyMu    sync.Mutex
+	lazyPeers map[netip.Addr]lazyPeerEntry
 }
+
+// lazyPeerEntry is one server-side lazy-peer index entry: the peer's node
+// key plus when peerConfig last vouched for it. Entries older than
+// lazyPeerTTL are evicted opportunistically on insertion.
+type lazyPeerEntry struct {
+	key key.NodePublic
+	at  time.Time
+}
+
+// lazyPeerTTL bounds how long a lazy-peer index entry survives without a
+// refresh. Real traffic keeps refreshing it (every re-handshake re-queries
+// peerConfig); stale entries from one-shot forged initiations age out.
+const lazyPeerTTL = 24 * time.Hour
 
 func (b *locoBackend) derpRegionID() tailcfg.DERPRegionID {
 	if b.dm == nil {
@@ -1511,12 +1538,56 @@ func (b *locoBackend) peerConfig(k key.NodePublic) (_ wgcfg.PeerConfig, ok bool)
 		return wgcfg.PeerConfig{}, false
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	n, ok := b.clients[k]
-	if !ok {
+	allowed := true
+	if !ok && b.allowedClients != nil {
+		allowed = b.allowedClients[k]
+	}
+	b.mu.Unlock()
+	if ok {
+		return withPSK(n.AllowedIPs), true
+	}
+	if !allowed {
 		return wgcfg.PeerConfig{}, false
 	}
-	return withPSK(n.AllowedIPs), true
+	// 懒注册：未知 key 也放行。到达这里即证明 initiation 是用本机公钥
+	// 加密的（发起方持地址/token）；真正的准入凭据是 PSK，在握手往返中
+	// 验证——未持 PSK 的伪造者建不出 session，其懒 peer 由 wireguard-go
+	// 按 RejectAfterTime*3 自回收。记入索引让握手完成后的回程流量在
+	// meow 注册前也能路由（见 peerByIP）。
+	b.noteLazyPeer(k)
+	return withPSK([]netip.Prefix{pfxOf(tcAddrForKey(k))}), true
+}
+
+// noteLazyPeer records k in the lazy-peer index for return-path routing
+// before the meow registration lands. Insertion opportunistically evicts
+// entries older than lazyPeerTTL; the eviction sweep is cheap because it
+// only runs when a new peer handshake arrives.
+func (b *locoBackend) noteLazyPeer(k key.NodePublic) {
+	addr := tcAddrForKey(k)
+	b.lazyMu.Lock()
+	defer b.lazyMu.Unlock()
+	if b.lazyPeers == nil {
+		b.lazyPeers = make(map[netip.Addr]lazyPeerEntry)
+	}
+	now := time.Now()
+	for a, e := range b.lazyPeers {
+		if now.Sub(e.at) > lazyPeerTTL {
+			delete(b.lazyPeers, a)
+		}
+	}
+	b.lazyPeers[addr] = lazyPeerEntry{key: k, at: now}
+}
+
+// lazyPeerByAddr looks up the lazy-peer index for return-path routing.
+func (b *locoBackend) lazyPeerByAddr(dst netip.Addr) (key.NodePublic, bool) {
+	b.lazyMu.Lock()
+	defer b.lazyMu.Unlock()
+	e, ok := b.lazyPeers[dst]
+	if !ok {
+		return key.NodePublic{}, false
+	}
+	return e.key, true
 }
 
 // peerByIP returns the public key of the peer that outbound packets
@@ -1528,11 +1599,19 @@ func (b *locoBackend) peerByIP(dst netip.Addr) (_ key.NodePublic, ok bool) {
 		return b.serverPub, true
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	for k := range b.clients {
 		if tcAddrForKey(k) == dst {
+			b.mu.Unlock()
 			return k, true
 		}
+	}
+	b.mu.Unlock()
+	// 懒注册 peer 的回程兜底：meow 注册前（直连握手建连）b.clients 还没有
+	// 该 peer，查 peerConfig 放行时记的索引。后续 AllowedIPs.LookupFromPacket
+	// 自带的 LookupPeer 会找到活跃的懒 peer；伪造者的索引项指向无 session
+	// 的 peer，加密回程包构造不出，无危害。
+	if k, ok := b.lazyPeerByAddr(dst); ok {
+		return k, true
 	}
 	return key.NodePublic{}, false
 }
@@ -1700,6 +1779,14 @@ func (b *locoBackend) advertiseEndpoints() {
 	}
 }
 
+// firstFew returns up to three AddrPorts for compact logging.
+func firstFew(aps []netip.AddrPort) []netip.AddrPort {
+	if len(aps) > 3 {
+		aps = aps[:3]
+	}
+	return aps
+}
+
 // nodeHasAddr reports whether ip is one of n's tailcat addresses.
 func nodeHasAddr(n tailcfg.NodeView, ip netip.Addr) bool {
 	if !n.Valid() {
@@ -1771,8 +1858,10 @@ func (lb *locoBackend) Start() error {
 			Addresses:  []netip.Prefix{serverAddrPrefix},
 			AllowedIPs: []netip.Prefix{serverAddrPrefix, allIPv6},
 			HomeDERP:   derpRegion,
-			// 地址端点提示：预置直连候选（updateFromNode 会把它们当作
-			// 普通 netmap 端点去 disco ping，pong 回来即定 bestAddr）。
+			// 地址端点提示：预置直连候选（disco ping 的目标，pong 回来即定
+			// bestAddr——meow 注册完成前 pong 不回，但 server 的懒注册让
+			// WireGuard 握手不依赖 meow，数据面经 DERP 先行、meow 完成后
+			// disco 促切直连）。候选的排序与过滤见 sortEndpoints。
 			Endpoints: lb.serverHints,
 		}).View())
 	}
@@ -2014,6 +2103,25 @@ type Client struct {
 	// before the client's first use.
 	DERPMapCache DERPMapCache
 
+	// DirectConnect 开启「直连握手先行」（openspec direct-handshake-connect）：
+	// 地址带未过期端点候选时，server peer 以 WireGuard-only 形态建 netmap，
+	// 握手与数据直发候选（零 disco/零 DERP）；TSMP 探测失败回落完整会合。
+	// 默认 false（保守：CLI 与既有调用方行为不变）；App 核按隐藏开关传入。
+	DirectConnect bool
+
+	// meowedOnce：后台 meow 补注册是否已成功（b2 形态的幂等闩锁）。
+	meowedOnce atomic.Bool
+
+	// LearnedEndpoints 是调用方预读的「端点学习缓存」（上次会话学到
+	// 的出口直连端点，出口端口漂移场景的关键候选）：排在全部 hint 候选
+	// 之前参与调度。存储由调用方（tunmode）负责，库只消费。
+	LearnedEndpoints []netip.AddrPort
+
+	// NetInfo 是建连时的手机网络上下文（承载类型 + 当前接口前缀），
+	// 供网络感知候选调度（SortEndpoints）使用；nil = 判据缺失，保守
+	// 地不排序不过滤。必须在首次使用前设置。
+	NetInfo *LocalNetInfo
+
 	lb       *locoBackend
 	ci       ConnInfo      // of server
 	meowWait chan struct{} // closed on first meowed message from server
@@ -2077,8 +2185,16 @@ func (c *Client) initLocked() error {
 	// 地址端点提示：把未过期的直连候选提前放进 netmap（探测与经 DERP 的
 	// meow 注册并发；注册仍走 DERP，这里只是让候选早于 CallMeMaybe 就位）。
 	fresh, stale := FreshEndpointHints(ci.EndpointHints, time.Now())
-	for _, h := range fresh {
-		lb.serverHints = append(lb.serverHints, h.AddrPort)
+	// 网络感知调度：蜂窝滤私网/优 v6、Wi-Fi 同网段最优先（纯函数，
+	// 见 endpointsched.go）。判据缺失时保守原序。
+	var netInfo LocalNetInfo
+	if c.NetInfo != nil {
+		netInfo = *c.NetInfo
+	}
+	scheduled, schedFiltered := SortEndpoints(c.LearnedEndpoints, fresh, netInfo)
+	lb.serverHints = scheduled
+	if len(schedFiltered) > 0 {
+		logf("connect: 调度 bearer=%q 滤除=%v 先试=%v", netInfo.Bearer, schedFiltered, firstFew(scheduled))
 	}
 	switch {
 	case len(ci.EndpointHints) == 0:
@@ -2095,6 +2211,11 @@ func (c *Client) initLocked() error {
 		} else {
 			logf("connect: hint 候选 %d 条（%s），探测与注册并发", len(fresh), tiers)
 		}
+	}
+
+	if c.DirectConnect && len(fresh) > 0 {
+		lb.directFirst.Store(true)
+		logf("connect: direct-first（握手先行 + meow 异步注册，候选 %d 条；探测未成回落会合）", len(fresh))
 	}
 
 	sys := &lb.sys
@@ -2183,6 +2304,18 @@ func (c *Client) initLocked() error {
 	return nil
 }
 
+// ServerPublicKey returns the server's node public key from the parsed
+// address. The client must have been started (ensureStarted/Ping/Dial).
+// It identifies the endpoint-learning cache file for this server.
+func (c *Client) ServerPublicKey() key.NodePublic {
+	c.startMu.Lock()
+	defer c.startMu.Unlock()
+	if c.ci.ServerPublic.IsZero() {
+		return key.NodePublic{}
+	}
+	return c.ci.ServerPublic.NodePublic
+}
+
 // PublicKey returns the client's node public key, generating the key
 // first if the Key field is zero and the client hasn't yet been used.
 func (c *Client) PublicKey() key.NodePublic {
@@ -2254,6 +2387,16 @@ func (c *Client) ensureStarted(ctx context.Context) error {
 func (c *Client) up(ctx context.Context) error {
 	if c.upDone.Load() {
 		return nil
+	}
+	// 先启动再判模式：首次调用时 c.lb 还没建（initLocked 在 ensureStarted
+	// 里跑、serverWGOnly 也是那时才置位），先判断会永远走普通路径。
+	if err := c.ensureStarted(ctx); err != nil {
+		return err
+	}
+	if c.lb.directFirst.Load() {
+		// 直连优先模式（directconnect.go）：就绪判据是 TSMP 探测
+		// （握手经懒注册放行，不依赖 meow），meow 转后台异步补注册。
+		return c.PingDirect(ctx)
 	}
 	_, err := c.Ping(ctx)
 	return err

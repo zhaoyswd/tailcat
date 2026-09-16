@@ -3,6 +3,8 @@
 package main
 
 import (
+	"fmt"
+	"net"
 	"net/netip"
 	"strings"
 	"testing"
@@ -50,7 +52,7 @@ func TestEndpointClassifyTrustedViaUPnP(t *testing.T) {
 		MappedPort: 41641,
 		ListenPort: 41641,
 	}
-	hints, basis := endpointClassify(obs, nil, nil, time.Unix(1, 0))
+	hints, basis := endpointClassify(obs, nil, nil, nil, time.Unix(1, 0))
 	h := oneHint(t, hints)
 	if h.Tier != tailcat.EndpointHintTrusted || h.AddrPort.String() != "114.242.60.128:41641" {
 		t.Errorf("UPnP: got %+v", h)
@@ -69,7 +71,7 @@ func TestEndpointClassifyUPnPButRewrittenExcluded(t *testing.T) {
 		MappedPort: 45141,
 		ListenPort: 45141,
 	}
-	hints, basis := endpointClassify(obs, nil, nil, time.Unix(1, 0))
+	hints, basis := endpointClassify(obs, nil, nil, nil, time.Unix(1, 0))
 	if len(hints) != 0 {
 		t.Errorf("rewritten+UPnP: want no hints, got %v", hints)
 	}
@@ -81,7 +83,7 @@ func TestEndpointClassifyUPnPButRewrittenExcluded(t *testing.T) {
 func TestEndpointClassifyTrustedLocalPublic(t *testing.T) {
 	gv4 := ap4(t, "123.56.218.212:41641") // 公网 IP 直接在网卡上（云主机）
 	obs := tailcat.EndpointHintObservation{Report: mkReport(gv4, opt.NewBool(false)), ListenPort: 41641}
-	hints, _ := endpointClassify(obs, []netip.Addr{netip.MustParseAddr("123.56.218.212")}, nil, time.Unix(1, 0))
+	hints, _ := endpointClassify(obs, []netip.Addr{netip.MustParseAddr("123.56.218.212")}, nil, nil, time.Unix(1, 0))
 	h := oneHint(t, hints)
 	if h.Tier != tailcat.EndpointHintTrusted || h.AddrPort != gv4 {
 		t.Errorf("local-public: got %+v", h)
@@ -94,7 +96,7 @@ func TestEndpointClassifyTrustedAdvertisePort(t *testing.T) {
 		ListenPort:    41641,
 		AdvertisePort: 41642, // 静态转发：路由器把外部 41642 转到本机 41641
 	}
-	hints, _ := endpointClassify(obs, nil, nil, time.Unix(1, 0))
+	hints, _ := endpointClassify(obs, nil, nil, nil, time.Unix(1, 0))
 	h := oneHint(t, hints)
 	if h.Tier != tailcat.EndpointHintTrusted || h.AddrPort.String() != "114.242.60.128:41642" {
 		t.Errorf("advertise-port: got %+v", h)
@@ -110,7 +112,7 @@ func TestEndpointClassifyBestEffortConeNAT(t *testing.T) {
 	// 可以不等于监听端口（NAT 任意分配外部端口），所以只有「对同一目标的多次
 	// 观测一致」才有意义。这里给 ListenPort=0（未钉端口）代表典型随机端口场景。
 	obs.ListenPort = 0
-	hints, basis := endpointClassify(obs, nil, nil, time.Unix(1, 0))
+	hints, basis := endpointClassify(obs, nil, nil, nil, time.Unix(1, 0))
 	h := oneHint(t, hints)
 	if h.Tier != tailcat.EndpointHintBestEffort || h.AddrPort != gv4 {
 		t.Errorf("cone NAT: got %+v", h)
@@ -126,7 +128,7 @@ func TestEndpointClassifySymmetricNATExcluded(t *testing.T) {
 		MappedPort: 41641, // 即使拿到了映射，映射随目标变化也不可信
 		ListenPort: 41641,
 	}
-	hints, basis := endpointClassify(obs, nil, nil, time.Unix(1, 0))
+	hints, basis := endpointClassify(obs, nil, nil, nil, time.Unix(1, 0))
 	if len(hints) != 0 {
 		t.Errorf("symmetric NAT: want no hints, got %v", hints)
 	}
@@ -141,7 +143,7 @@ func TestEndpointClassifyPortRewrittenExcluded(t *testing.T) {
 		Report:     mkReport(ap4(t, "114.242.60.128:55557"), opt.NewBool(false)),
 		ListenPort: 41641,
 	}
-	hints, basis := endpointClassify(obs, nil, nil, time.Unix(1, 0))
+	hints, basis := endpointClassify(obs, nil, nil, nil, time.Unix(1, 0))
 	if len(hints) != 0 {
 		t.Errorf("port rewritten: want no hints, got %v", hints)
 	}
@@ -153,19 +155,19 @@ func TestEndpointClassifyPortRewrittenExcluded(t *testing.T) {
 func TestEndpointClassifyNoMappingNoSTUN(t *testing.T) {
 	// 无映射（无 UPnP、锥形 NAT）与无 STUN 结果两种输入：前者②、后者无候选。
 	obs := tailcat.EndpointHintObservation{Report: mkReport(ap4(t, "1.2.3.4:41641"), opt.NewBool(false))}
-	hints, _ := endpointClassify(obs, nil, nil, time.Unix(1, 0))
+	hints, _ := endpointClassify(obs, nil, nil, nil, time.Unix(1, 0))
 	if len(hints) != 1 || hints[0].Tier != tailcat.EndpointHintBestEffort {
 		t.Errorf("no mapping: got %v", hints)
 	}
 
 	obs.Report = &netcheck.Report{UDP: false} // 无 STUN 结果
-	hints, basis := endpointClassify(obs, nil, nil, time.Unix(1, 0))
+	hints, basis := endpointClassify(obs, nil, nil, nil, time.Unix(1, 0))
 	if len(hints) != 0 || !strings.Contains(basis, "v4=无STUN映射") {
 		t.Errorf("no STUN: hints=%v basis=%s", hints, basis)
 	}
 
 	obs.Report = nil
-	hints, basis = endpointClassify(obs, nil, nil, time.Unix(1, 0))
+	hints, basis = endpointClassify(obs, nil, nil, nil, time.Unix(1, 0))
 	if len(hints) != 0 || !strings.Contains(basis, "无netcheck") {
 		t.Errorf("nil report: hints=%v basis=%s", hints, basis)
 	}
@@ -178,7 +180,7 @@ func TestEndpointClassifyIPv6AndManual(t *testing.T) {
 	r.GlobalV6 = gv6
 	obs := tailcat.EndpointHintObservation{Report: r, ListenPort: 41641}
 	manual := []netip.AddrPort{ap4(t, "203.0.113.4:41641")}
-	hints, basis := endpointClassify(obs, nil, manual, time.Unix(1, 0))
+	hints, basis := endpointClassify(obs, nil, nil, manual, time.Unix(1, 0))
 	if len(hints) != 3 {
 		t.Fatalf("want v4+v6+manual = 3 hints, got %d: %v", len(hints), hints)
 	}
@@ -200,7 +202,7 @@ func TestEndpointClassifyPrivateOrCGNATExcluded(t *testing.T) {
 	// STUN 返回私网/CGNAT 段：异常输入，不作为候选（避免把内网地址发给对端）。
 	for _, s := range []string{"192.168.3.5:41641", "100.64.1.2:41641", "127.0.0.1:41641"} {
 		obs := tailcat.EndpointHintObservation{Report: mkReport(ap4(t, s), opt.NewBool(false))}
-		hints, _ := endpointClassify(obs, nil, nil, time.Unix(1, 0))
+		hints, _ := endpointClassify(obs, nil, nil, nil, time.Unix(1, 0))
 		if len(hints) != 0 {
 			t.Errorf("%s: want no hints, got %v", s, hints)
 		}
@@ -230,5 +232,93 @@ func TestPublishEndpointHintsDisabledAnnouncesPlain(t *testing.T) {
 	case a := <-got:
 		t.Errorf("announced twice: %v", a)
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// ————— ④LAN 档（openspec direct-handshake-connect） —————
+
+func TestLANAddrsFromIfaces(t *testing.T) {
+	mk := func(name string, flags net.Flags, ips ...string) lanIfAddrs {
+		var addrs []net.Addr
+		for _, ip := range ips {
+			addrs = append(addrs, &net.IPNet{IP: net.ParseIP(ip), Mask: net.CIDRMask(24, 32)})
+		}
+		return lanIfAddrs{name: name, flags: flags, addrs: addrs}
+	}
+	ifaces := []lanIfAddrs{
+		mk("en0", net.FlagUp, "192.168.3.12"),     // 物理 + RFC1918 → 收
+		mk("docker0", net.FlagUp, "172.17.0.1"),   // 容器桥 → 排除
+		mk("vethabc123", net.FlagUp, "10.88.0.1"), // veth → 排除
+		mk("lo0", net.FlagUp|net.FlagLoopback, "127.0.0.1"),
+		mk("en5", net.FlagUp, "100.64.5.5"),   // CGNAT → 排除（不是家庭 LAN）
+		mk("en6", net.FlagUp, "203.0.113.9"),  // 公网 v4 → 不属 LAN 档
+		mk("en7", 0, "192.168.4.4"),           // down → 排除
+		mk("utun3", net.FlagUp, "192.168.9.9"), // VPN 虚拟 → 排除
+	}
+	got := lanAddrsFromIfaces(ifaces)
+	if len(got) != 1 || got[0] != netip.MustParseAddr("192.168.3.12") {
+		t.Fatalf("lanAddrsFromIfaces = %v; want [192.168.3.12]", got)
+	}
+}
+
+func TestEndpointClassifyLANHint(t *testing.T) {
+	obs := tailcat.EndpointHintObservation{
+		ListenPort: 41641,
+		Report:     nil, // LAN 是本机接口事实，不依赖 netcheck
+	}
+	lan := []netip.Addr{netip.MustParseAddr("192.168.3.12")}
+	hints, basis := endpointClassify(obs, nil, lan, nil, time.Unix(1, 0))
+	if len(hints) != 1 {
+		t.Fatalf("want 1 LAN hint, got %d: %v", len(hints), hints)
+	}
+	want := netip.MustParseAddrPort("192.168.3.12:41641")
+	if hints[0].AddrPort != want || hints[0].Tier != tailcat.EndpointHintLAN {
+		t.Fatalf("LAN hint = %+v; want %v tier④", hints[0], want)
+	}
+	if !strings.Contains(basis, "④LAN") {
+		t.Errorf("basis missing ④LAN: %s", basis)
+	}
+}
+
+func TestEndpointClassifyLANWithoutListenPort(t *testing.T) {
+	obs := tailcat.EndpointHintObservation{Report: mkReport(ap4(t, "114.242.60.128:41641"), opt.NewBool(false))}
+	lan := []netip.Addr{netip.MustParseAddr("192.168.3.12")}
+	hints, basis := endpointClassify(obs, nil, lan, nil, time.Unix(1, 0))
+	for _, h := range hints {
+		if h.Tier == tailcat.EndpointHintLAN {
+			t.Fatalf("ListenPort=0 仍写了④LAN: %+v", h)
+		}
+	}
+	if !strings.Contains(basis, "监听端口未钉死") {
+		t.Errorf("basis missing skip note: %s", basis)
+	}
+}
+
+func TestEndpointClassifyCapsAtMax(t *testing.T) {
+	// 1(v4) + 1(v6) + 7(LAN) + 3(manual) = 12 > MaxEndpointHints(8) ⇒ 截 4。
+	r := mkReport(ap4(t, "114.242.60.128:41641"), opt.NewBool(false))
+	r.IPv6 = true
+	r.GlobalV6 = netip.MustParseAddrPort("[2606:4700::1]:41641")
+	obs := tailcat.EndpointHintObservation{Report: r, ListenPort: 41641}
+	var lan []netip.Addr
+	for i := 2; i <= 8; i++ { // 192.168.0.2 .. 192.168.0.8 = 7 条
+		lan = append(lan, netip.MustParseAddr(fmt.Sprintf("192.168.0.%d", i)))
+	}
+	var manual []netip.AddrPort
+	for i := 1; i <= 3; i++ {
+		manual = append(manual, ap4(t, fmt.Sprintf("203.0.113.%d:41641", i)))
+	}
+	hints, basis := endpointClassify(obs, nil, lan, manual, time.Unix(1, 0))
+	if len(hints) != tailcat.MaxEndpointHints {
+		t.Fatalf("want cap %d hints, got %d", tailcat.MaxEndpointHints, len(hints))
+	}
+	// 截的是尾部（manual 优先出局）。
+	for _, h := range hints {
+		if h.Tier == tailcat.EndpointHintManual {
+			t.Errorf("manual hint survived cap: %+v", h)
+		}
+	}
+	if !strings.Contains(basis, "候选超上限") {
+		t.Errorf("basis missing cap note: %s", basis)
 	}
 }

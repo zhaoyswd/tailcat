@@ -52,7 +52,7 @@ func publishEndpointHints(s *tailcat.Server, ci *tailcat.ConnInfo, plainAddr tai
 	go func() {
 		obs := waitForEndpointHintObservation(s, logf)
 		manual := parseManualEndpoints(logf)
-		hints, basis := endpointClassify(obs, localPublicAddrs(), manual, time.Now())
+		hints, basis := endpointClassify(obs, localPublicAddrs(), localLANAddrs(), manual, time.Now())
 		logf("endpoint-hint: %s", basis)
 		if len(hints) == 0 {
 			announce(plainAddr)
@@ -110,6 +110,65 @@ func localPublicAddrs() (pub []netip.Addr) {
 	return pub
 }
 
+// localLANAddrs 返回本机**物理**网卡上的 RFC1918 IPv4 地址（④LAN 候选，
+// openspec direct-handshake-connect）。虚拟网卡（docker0/bridge/veth 等容器与
+// 虚拟网段）被排除——它们的「LAN」对任何客户端都不可达。CGNAT 段（100.64/10）
+// 不是家庭 LAN，同样排除。
+func localLANAddrs() []netip.Addr {
+	sysIfs, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	ifaces := make([]lanIfAddrs, 0, len(sysIfs))
+	for _, ifc := range sysIfs {
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		ifaces = append(ifaces, lanIfAddrs{name: ifc.Name, flags: ifc.Flags, addrs: addrs})
+	}
+	return lanAddrsFromIfaces(ifaces)
+}
+
+// lanIfAddrs 是 lanAddrsFromIfaces 的输入单元：接口名/标志/已解析地址
+// （net.Interface 的 Addrs 是系统调用、不可注入，纯函数收三元组以便单测）。
+type lanIfAddrs struct {
+	name  string
+	flags net.Flags
+	addrs []net.Addr
+}
+
+// lanAddrsFromIfaces 是 localLANAddrs 的纯函数形态（单测覆盖）。
+func lanAddrsFromIfaces(ifaces []lanIfAddrs) (lan []netip.Addr) {
+	for _, ifc := range ifaces {
+		if tailcat.IsVirtualInterface(ifc.name) {
+			continue
+		}
+		if ifc.flags&net.FlagUp == 0 || ifc.flags&net.FlagLoopback != 0 {
+			continue
+		}
+		for _, a := range ifc.addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			addr, ok := netip.AddrFromSlice(ipn.IP)
+			if !ok {
+				continue
+			}
+			addr = addr.Unmap() // net.ParseIP/接口地址可能是 4-in-6 表示
+			if !addr.Is4() {
+				continue
+			}
+			if !addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || tsaddr.CGNATRange().Contains(addr) {
+				continue
+			}
+			lan = append(lan, addr)
+		}
+	}
+	return lan
+}
+
 // isPublicV4：可作直连候选的 v4 —— 非私网、非 CGNAT（tsaddr 判，IsPrivate 不含
 // 100.64/10）、非回环/链路本地。
 func isPublicV4(a netip.Addr) bool {
@@ -148,7 +207,7 @@ func parseManualEndpoints(logf func(string, ...any)) (out []netip.AddrPort) {
 //
 // v6 一律 ②（家用路由器 v6 入站防火墙多为默认拒绝，本机判不了），
 // 端口自洽检查同样适用。--endpoint 的手动项以 ③手动 档追加在最后。
-func endpointClassify(obs tailcat.EndpointHintObservation, localPublic []netip.Addr, manual []netip.AddrPort, now time.Time) (hints []tailcat.EndpointHint, basis string) {
+func endpointClassify(obs tailcat.EndpointHintObservation, localPublic []netip.Addr, lan []netip.Addr, manual []netip.AddrPort, now time.Time) (hints []tailcat.EndpointHint, basis string) {
 	var parts []string
 	r := obs.Report
 	if r == nil {
@@ -200,9 +259,38 @@ func endpointClassify(obs tailcat.EndpointHintObservation, localPublic []netip.A
 			parts = append(parts, "v6=无")
 		}
 	}
+	// ④LAN：本机物理网卡的 RFC1918 地址，端口取监听端口。不经 NAT、不受
+	// netcheck/对称 NAT 判定影响（无 netcheck 结果时也成立）。ListenPort=0
+	// （随机端口）时无稳定端口语义，跳过。仅同网段的客户端可达——取舍交给
+	// 客户端的网络感知调度（蜂窝丢弃、Wi-Fi 同网段最优先）。
+	if obs.ListenPort != 0 {
+		var lanParts []string
+		for _, a := range lan {
+			ap := netip.AddrPortFrom(a, obs.ListenPort)
+			hints = append(hints, tailcat.EndpointHint{AddrPort: ap, Tier: tailcat.EndpointHintLAN, Generated: now.Unix()})
+			lanParts = append(lanParts, ap.String())
+		}
+		if len(lanParts) > 0 {
+			parts = append(parts, fmt.Sprintf("LAN=%s 档=%s(仅同网段客户端可达)", strings.Join(lanParts, ","), tailcat.EndpointHintTierName(tailcat.EndpointHintLAN)))
+		}
+	} else if len(lan) > 0 {
+		parts = append(parts, "LAN=有私网地址但监听端口未钉死，跳过④档")
+	}
 	for _, ap := range manual {
 		hints = append(hints, tailcat.EndpointHint{AddrPort: ap, Tier: tailcat.EndpointHintManual, Generated: now.Unix()})
 		parts = append(parts, fmt.Sprintf("手动=%v 档=%s", ap, tailcat.EndpointHintTierName(tailcat.EndpointHintManual)))
+	}
+	// 生成端封顶：候选序为 公网(v4/v6) → ④LAN → ③手动，超 MaxEndpointHints
+	// 从尾部截（优先截手动项；客户端 ParseAddr 对候选数有硬校验，生成端
+	// 不封顶会造出自家客户端拒解析的地址）。
+	if n := len(hints); n > tailcat.MaxEndpointHints {
+		cut := hints[tailcat.MaxEndpointHints:]
+		hints = hints[:tailcat.MaxEndpointHints]
+		var cutDesc []string
+		for _, h := range cut {
+			cutDesc = append(cutDesc, h.AddrPort.String())
+		}
+		parts = append(parts, fmt.Sprintf("候选超上限：截掉 %d 条(%s)", len(cut), strings.Join(cutDesc, ",")))
 	}
 	if len(hints) == 0 && len(parts) > 0 {
 		parts = append(parts, "⇒ 地址不带端点提示")

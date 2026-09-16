@@ -387,3 +387,68 @@ func socks5Connect(t *testing.T, proxyAddr string, dst netip.AddrPort) net.Conn 
 	c.SetDeadline(time.Time{})
 	return c
 }
+
+// TestDirectConnectHandshake — 直连握手先行（openspec
+// direct-handshake-connect）：--endpoint 提供指向 server 监听端口的
+// ③手动候选 + --direct-connect，客户端以 WireGuard-only peer 直发握手、
+// TSMP 探测就绪，echo 全通。此时 meow 的异步注册可能还没到，服务端
+// 回程只能走懒注册索引——本测试同时端到端验证懒注册闭环。
+func TestDirectConnectHandshake(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t)
+	port := startEchoListener(t)
+	dst := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)
+
+	listen := freePort(t)
+	_, addr, serverStderr := e.startServer("--verbose", "--serve=exit-node",
+		"--listen-port="+strconv.Itoa(listen),
+		"--endpoint=127.0.0.1:"+strconv.Itoa(listen))
+
+	const payload = "echo via direct handshake"
+	got, err := runClient(t, e.cmd("--verbose", "--key=new", "--derpmap-url="+e.derpMapURL,
+		"--direct-connect", addr, dst.String()), serverStderr, payload)
+	if err != nil {
+		t.Fatalf("direct-connect client: %v", err)
+	}
+	if got != payload {
+		t.Errorf("direct-connect echoed %q; want %q", got, payload)
+	}
+	if !strings.Contains(serverStderr.String(), "手动=127.0.0.1:"+strconv.Itoa(listen)) {
+		t.Errorf("server address missing manual hint; stderr:\n%s", serverStderr.String())
+	}
+}
+
+// TestDirectConnectFallback — 候选不可达时回落完整 DERP 会合：
+// 指向无人监听端口的候选让 TSMP 探测超时，客户端应重建普通 endpoint
+// 并按现状 meow 会合，echo 仍通（对官方服务端这也是必然路径）。
+func TestDirectConnectFallback(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t)
+	port := startEchoListener(t)
+	dst := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)
+
+	// 端口 1 上不会有 magicsock：探测必失败 → 回落。
+	_, addr, serverStderr := e.startServer("--verbose", "--serve=exit-node",
+		"--endpoint=127.0.0.1:1")
+
+	const payload = "echo after direct fallback"
+	got, err := runClient(t, e.cmd("--verbose", "--key=new", "--derpmap-url="+e.derpMapURL,
+		"--direct-connect", addr, dst.String()), serverStderr, payload)
+	if err != nil {
+		t.Fatalf("direct-connect fallback client: %v", err)
+	}
+	if got != payload {
+		t.Errorf("fallback echoed %q; want %q", got, payload)
+	}
+}
+
+// freePort asks the kernel for a free UDP port (bind :0, read it back, close).
+func freePort(t *testing.T) int {
+	t.Helper()
+	c, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	return c.LocalAddr().(*net.UDPAddr).Port
+}
