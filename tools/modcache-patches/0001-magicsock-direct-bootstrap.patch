@@ -1,0 +1,336 @@
+--- a/wgengine/magicsock/endpoint.go
++++ b/wgengine/magicsock/endpoint.go
+@@ -104,6 +104,14 @@
+ 	expired         bool // whether the node has expired
+ 	isWireguardOnly bool // whether the endpoint is WireGuard only. Must not be changed after initializing the endpont.
+ 	relayCapable    bool // whether the node is capable of speaking via a [tailscale.com/net/udprelay.Server]
++
++	// provisional reports whether this endpoint was synthesized from an
++	// inbound WireGuard handshake (see [Conn.upsertProvisionalEndpointLocked])
++	// rather than from a network map. Provisional endpoints carry a synthetic
++	// node ID and no control-learned disco key, so they are replaced by the
++	// network map version as soon as one exists, and they are exempt from the
++	// network map cleanup that deletes endpoints for unknown node keys.
++	provisional bool
+ }
+ 
+ // udpRelayEndpointReady determines whether the given relay [addrQuality] should
+@@ -643,6 +651,21 @@
+ 		return udpAddr, netip.AddrPort{}, shouldPing
+ 	}
+ 
++	// PATCH(tier): bootstrap candidates. We have no trusted bestAddr, so
++	// normally there is nothing to send to but DERP. If the caller asked for
++	// bootstrap sends ([Conn.SetBootstrapCandidates]) and we do have candidate
++	// endpoints — carried in the tailcat address or learned from a previous
++	// session — use one of them as the UDP destination as well, so that the
++	// very first WireGuard handshake can go direct. DERP is still returned, so
++	// when a relay is reachable the behaviour is unchanged (the packet is
++	// simply mirrored on both paths, exactly like the expired-bestAddr case
++	// below).
++	if de.c.bootstrapCandidates.Load() && !udpAddr.ap.IsValid() && len(de.endpointState) > 0 {
++		if candidate, _ := de.addrForWireGuardSendLocked(now); candidate.ap.IsValid() {
++			udpAddr = candidate
++		}
++	}
++
+ 	// We had a bestAddr but it expired so send both to it
+ 	// and DERP.
+ 	return udpAddr, de.derpAddr, false
+--- a/wgengine/magicsock/magicsock.go
++++ b/wgengine/magicsock/magicsock.go
+@@ -428,6 +428,29 @@
+ 	// This allows tests to pass when the user's machine is offline,
+ 	// but allows us to still test network-down behaviour when desired.
+ 	checkNetworkUpDuringTests bool
++
++	// PATCH(tier): direct-bootstrap support.
++	//
++	// bootstrapCandidates lets [endpoint.addrForSendLocked] use a known
++	// candidate endpoint (carried in the tailcat address or learned from a
++	// previous session) as a UDP destination before any path has been verified,
++	// so the first WireGuard handshake can go direct instead of being relayed.
++	// Off by default: behaviour is unchanged for other tailscale.com users.
++	bootstrapCandidates atomic.Bool
++
++	// acceptProvisionalInitiators lets this node answer a WireGuard handshake
++	// from a peer key it has never heard of (no control plane, so a tailcat
++	// exit node learns its clients from this very handshake). When enabled,
++	// [lazyEndpoint.InitiationMessagePublicKey] synthesizes a provisional
++	// endpoint for the sender and records its source address, which is what
++	// makes [Conn.ParseEndpoint] and the handshake response possible.
++	// Off by default.
++	acceptProvisionalInitiators atomic.Bool
++
++	// provisionalPeers tracks the endpoints synthesized above, keyed by node
++	// key, with the time of their last received packet. Guarded by c.mu. Used
++	// only to bound them (see provisionalEndpointMax / provisionalEndpointIdle).
++	provisionalPeers map[key.NodePublic]mono.Time
+ }
+ 
+ // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
+@@ -2847,6 +2870,169 @@
+ 	c.peerMap.forEachEndpoint(func(ep *endpoint) {
+ 		ep.setHeartbeatDisabled(v)
+ 	})
++}
++
++// PATCH(tier): bounds for endpoints synthesized from inbound handshakes.
++const (
++	// provisionalEndpointMax caps how many unknown-key endpoints we hold at
++	// once. At the cap, new unknown-key handshakes are dropped (the behaviour
++	// before this patch) instead of letting anyone who has the address grow
++	// the table without bound.
++	provisionalEndpointMax = 32
++
++	// provisionalEndpointIdle is how long a provisional endpoint that received
++	// no packets survives. Live peers keep refreshing it; one-shot forged
++	// handshakes age out.
++	provisionalEndpointIdle = 10 * time.Minute
++)
++
++// SetBootstrapCandidates enables using known candidate endpoints as a UDP
++// destination before any path has been verified, so the first WireGuard
++// handshake can go direct instead of being relayed through DERP. Candidates
++// come from the caller (for tailcat: endpoint hints carried in the address and
++// endpoints learned from previous sessions). DERP is still used when it is
++// reachable; this only removes the requirement that it be reachable before a
++// direct path can be attempted. Defaults to false.
++func (c *Conn) SetBootstrapCandidates(v bool) {
++	c.bootstrapCandidates.Store(v)
++}
++
++// SetAcceptProvisionalInitiators enables answering WireGuard handshakes from
++// peer keys that are not in the network map. Without a control plane (tailcat
++// has none) an exit node learns its clients from this handshake, so this is
++// what makes a direct-only (no DERP) first connection possible.
++//
++// The cryptographic admission control is unchanged: the handshake still has to
++// verify the pre-shared key, and a peer only becomes routable for traffic that
++// same handshake authenticated. What changes is that an unknown sender can make
++// this node allocate a (bounded, idle-expired) endpoint and answer it. Treat the
++// tailcat address as a secret, as before. Defaults to false.
++func (c *Conn) SetAcceptProvisionalInitiators(v bool) {
++	c.acceptProvisionalInitiators.Store(v)
++	if !v {
++		c.dropProvisionalEndpoints()
++	}
++}
++
++// dropProvisionalEndpoints removes every synthesized endpoint.
++func (c *Conn) dropProvisionalEndpoints() {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	for k := range c.provisionalPeers {
++		if ep, ok := c.peerMap.endpointForNodeKey(k); ok && ep.provisional {
++			c.peerMap.deleteEndpoint(ep)
++		}
++		delete(c.provisionalPeers, k)
++	}
++}
++
++// provisionalNodeID returns a node ID for a synthesized endpoint. It must be
++// inheritedPathState is the path information a provisional endpoint carries —
++// the addresses we have actually received packets from, and the address we
++// were last able to reach — captured before the endpoint is replaced by the
++// network map version of the same peer.
++type inheritedPathState struct {
++	addrs []netip.AddrPort
++	best  addrQuality
++}
++
++// takeProvisionalPathState snapshots ep's learned path. The endpoint must be
++// withdrawn from the peer map by the caller immediately after (the snapshot is
++// what survives).
++func takeProvisionalPathState(ep *endpoint) *inheritedPathState {
++	st := &inheritedPathState{}
++	ep.mu.Lock()
++	for ap := range ep.endpointState {
++		st.addrs = append(st.addrs, ap)
++	}
++	st.best = ep.bestAddr
++	ep.mu.Unlock()
++	return st
++}
++
++// provisionalNodeID returns a node ID for a synthesized endpoint. It must be
++// non-zero ([peerMap.upsertEndpoint] rejects zero) and must not collide with
++// the small IDs a control plane hands out, so it lives in a high range derived
++// from the node key.
++func provisionalNodeID(pubKey key.NodePublic) tailcfg.NodeID {
++	raw := pubKey.Raw32()
++	var v uint64
++	for i := 0; i < 8; i++ {
++		v = v<<8 | uint64(raw[i])
++	}
++	return tailcfg.NodeID(v>>16) | (tailcfg.NodeID(1) << 62)
++}
++
++// upsertProvisionalEndpointLocked returns the endpoint for pubKey, creating a
++// synthesized one (with src recorded as its only reachable address) if this
++// node has never heard of pubKey. Returns ok == false when the bound is hit, in
++// which case the caller must drop the packet.
++//
++// c.mu must be held. The returned endpoint, if any, is safe to use as usual.
++func (c *Conn) upsertProvisionalEndpointLocked(pubKey key.NodePublic, src epAddr) (*endpoint, bool) {
++	now := mono.Now()
++	if ep, ok := c.peerMap.endpointForNodeKey(pubKey); ok {
++		if !ep.provisional {
++			// Raced with a network map update that created the real endpoint.
++			return ep, true
++		}
++		if c.provisionalPeers == nil {
++			c.provisionalPeers = make(map[key.NodePublic]mono.Time)
++		}
++		c.provisionalPeers[pubKey] = now
++		return ep, true
++	}
++
++	// Evict idle entries first; nothing else prunes these (they are not in the
++	// network map, so that cleanup deliberately skips them).
++	for k, seen := range c.provisionalPeers {
++		if now.Sub(seen) < provisionalEndpointIdle {
++			continue
++		}
++		if ep, ok := c.peerMap.endpointForNodeKey(k); ok && ep.provisional {
++			c.peerMap.deleteEndpoint(ep)
++		}
++		delete(c.provisionalPeers, k)
++	}
++	if len(c.provisionalPeers) >= provisionalEndpointMax {
++		c.logf("magicsock: provisional peers at cap (%d); dropping handshake from %v",
++			provisionalEndpointMax, pubKey.ShortString())
++		return nil, false
++	}
++
++	ep := &endpoint{
++		c:               c,
++		nodeID:          provisionalNodeID(pubKey),
++		publicKey:       pubKey,
++		publicKeyHex:    pubKey.UntypedHexString(),
++		sentPing:        map[stun.TxID]sentPing{},
++		endpointState:   map[netip.AddrPort]*endpointState{},
++		isWireguardOnly: true,
++		provisional:     true,
++	}
++	// nodeAddr stays zero: we do not know the peer's tailnet address (the
++	// caller's peer config derives that). It is only used for logging and for
++	// wireguard's handshake rate limiter.
++	//
++	// disco must be non-nil: [endpoint.updateFromNode] and the logging helpers
++	// dereference it. We know nothing about this peer's disco key, so mark the
++	// (empty) TSMP key as the active one.
++	ep.disco.Store(&endpointDisco{tsmpActive: true})
++	ep.initFakeUDPAddr()
++	ep.endpointState[src.ap] = &endpointState{lastGotPing: time.Now()}
++	ep.mu.Lock()
++	ep.setBestAddrLocked(addrQuality{epAddr: src})
++	ep.bestAddrAt = now
++	ep.trustBestAddrUntil = now.Add(trustUDPAddrDuration)
++	ep.mu.Unlock()
++	c.peerMap.upsertEndpoint(ep, key.DiscoPublic{}, false)
++	if c.provisionalPeers == nil {
++		c.provisionalPeers = make(map[key.NodePublic]mono.Time)
++	}
++	c.provisionalPeers[pubKey] = now
++	c.logf("magicsock: provisional peer %v learned from %v (direct handshake, no network map)",
++		pubKey.ShortString(), src)
++	return ep, true
+ }
+ 
+ // SilentDisco returns true if silent disco is enabled, otherwise false.
+@@ -3167,7 +3353,11 @@
+ 			keep.Add(n.Key())
+ 		}
+ 		c.peerMap.forEachEndpoint(func(ep *endpoint) {
+-			if !keep.Contains(ep.publicKey) {
++			// PATCH(tier): provisional endpoints are deliberately not in the
++			// network map (their whole point is to serve a peer the netmap
++			// does not know about), so they must survive this cleanup. They
++			// are bounded separately, in upsertProvisionalEndpointLocked.
++			if !keep.Contains(ep.publicKey) && !ep.provisional {
+ 				c.peerMap.deleteEndpoint(ep)
+ 			}
+ 		})
+@@ -3197,6 +3387,9 @@
+ 		devPanicf("node with zero key")
+ 		return
+ 	}
++	// PATCH(tier): path state inherited from a provisional endpoint that this
++	// network map promotes into a real peer (see below).
++	var inherited *inheritedPathState
+ 	ep, ok := c.peerMap.endpointForNodeID(n.ID())
+ 	if ok && ep.publicKey != n.Key() {
+ 		// The node rotated public keys. Delete the old endpoint and create
+@@ -3232,6 +3425,20 @@
+ 		return
+ 	}
+ 
++	if ep, ok := c.peerMap.endpointForNodeKey(n.Key()); ok {
++		// PATCH(tier): an endpoint synthesized from a direct handshake has a
++		// synthetic node ID and no control-learned disco key, so it cannot be
++		// updated in place ([endpoint.updateFromNode] dereferences its control
++		// disco key, which does not exist). The network map is authoritative:
++		// drop it and create the real endpoint below, but carry over the path
++		// state we learned from the handshake (the sender's address, which is
++		// the only direct path we know) instead of throwing it away.
++		if ep.provisional {
++			inherited = takeProvisionalPathState(ep)
++			c.peerMap.deleteEndpoint(ep)
++			delete(c.provisionalPeers, ep.publicKey)
++		}
++	}
+ 	if ep, ok := c.peerMap.endpointForNodeKey(n.Key()); ok {
+ 		// At this point n.Key() should be for a key we've never seen before. If
+ 		// ok was true above, it was an update to an existing matching key and
+@@ -3296,6 +3503,34 @@
+ 
+ 	ep.updateFromNode(n, flags.heartbeatDisabled, flags.probeUDPLifetimeOn)
+ 	c.peerMap.upsertEndpoint(ep, key.DiscoPublic{}, false)
++
++	// PATCH(tier): re-apply the direct path learned from a provisional
++	// endpoint, so that this peer can still be reached over UDP at the address
++	// its handshake came from (the network map carries no endpoints for it).
++	// DERP is available too now that the node is in the network map, so this
++	// only adds a preferred path; it does not remove the fallback.
++	if inherited != nil {
++		ep.mu.Lock()
++		now := mono.Now()
++		for _, ap := range inherited.addrs {
++			if _, ok := ep.endpointState[ap]; !ok {
++				ep.endpointState[ap] = &endpointState{lastGotPing: time.Now()}
++			}
++		}
++		if inherited.best.ap.IsValid() {
++			ep.setBestAddrLocked(inherited.best)
++			ep.bestAddrAt = now
++			ep.trustBestAddrUntil = now.Add(trustUDPAddrDuration)
++		}
++		ep.mu.Unlock()
++		// Teach the peer map which addresses belong to this peer, so inbound
++		// packets from them resolve directly instead of via a lazyEndpoint.
++		for _, ap := range inherited.addrs {
++			c.peerMap.setNodeKeyForEpAddr(epAddr{ap: ap}, ep.publicKey)
++		}
++		c.logf("magicsock: provisional peer %v promoted to network map; kept direct path %v",
++			ep.publicKey.ShortString(), inherited.addrs)
++	}
+ }
+ 
+ // UpsertPeer adds or updates a single peer in c. It is the efficient
+@@ -4426,6 +4661,15 @@
+ 	}
+ 	le.c.mu.Lock()
+ 	ep, ok := le.c.peerMap.endpointForNodeKey(pubKey)
++	if !ok && le.c.acceptProvisionalInitiators.Load() {
++		// PATCH(tier): this node has never heard of the sender (there is no
++		// control plane to tell us about it). Synthesize an endpoint keyed by
++		// its node key with le.src as its only address, so the peer config
++		// lookup below can succeed ([wgcfg.NewPeerLookupFunc] calls
++		// [Conn.ParseEndpoint], which requires a peerMap entry) and the
++		// handshake response has a destination.
++		ep, ok = le.c.upsertProvisionalEndpointLocked(pubKey, le.src)
++	}
+ 	le.c.mu.Unlock()
+ 	if !ok {
+ 		return

@@ -34,6 +34,12 @@ type wireConnInfo struct {
 	Region            []*wireRegion       `cbor:"r,omitempty" json:"Region,omitempty"`
 	RegionID          int64               `cbor:"i,omitempty" json:"RegionID,omitempty"`
 	EndpointHints     []*wireEndpointHint `cbor:"e,omitempty" json:"EndpointHints,omitempty"`
+
+	// Caps and Build are the capability advertisement described on
+	// [Caps]. Official builds never set them, so an absent field means
+	// "unknown build", not "no capabilities".
+	Caps  Caps   `cbor:"C,omitempty" json:"Caps,omitempty"`
+	Build string `cbor:"B,omitempty" json:"Build,omitempty"`
 }
 
 // wireEndpointHint is the wire form of [EndpointHint]: a direct-connect

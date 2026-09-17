@@ -1412,6 +1412,10 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	}
 	ci.ServerPublic = tailcat.NodePublic{NodePublic: priv.Public()}
 	ci.ServerDiscoPublic = tailcat.DiscoPublicForNode(priv)
+	// 能力标记：本构建支持的可选功能随地址一起公布（官方构建没有这个字段），
+	// 客户端据此判断这个出口能提供什么。见 buildcaps.go。
+	ci.Caps = forkCaps()
+	ci.Build = forkBuildTag()
 	connStr := ci.Addr()
 
 	if err := setupForwarding(reg); err != nil {
@@ -2051,6 +2055,10 @@ func genKey(args []string) error {
 		log.Fatal(err)
 	}
 	fmt.Fprintf(os.Stderr, "# wrote file to %v\n", *key)
+	// 打印的地址带能力标记（写在 key 文件之后：文件内容保持原样，标记是每次
+	// 生成地址时现贴的）。见 buildcaps.go。
+	priv.Public.Caps = forkCaps()
+	priv.Public.Build = forkBuildTag()
 	fmt.Println(priv.Public.Addr())
 	return nil
 }

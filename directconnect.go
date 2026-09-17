@@ -173,6 +173,10 @@ func raceFirst(ctx context.Context, meow <-chan struct{}, probe func(context.Con
 // handshake happens implicitly on the first outbound packet; server-side lazy
 // registration admits it before (or without) the meow arriving.
 func (c *Client) probeTSMP(parent context.Context) error {
+	// 每次探针尝试都重新武装一次握手：尝试之间因此不是「重发同一个 initiation」，
+	// 而是一次全新的握手（新 ephemeral/时间戳）。理由见 handshakeheal.go —— 重发同一
+	// 个 initiation 会被响应方按防重放丢弃，首包丢了就白等整个重试周期。
+	c.KickStaleHandshake(0)
 	c.lb.mu.Lock()
 	nm := c.lb.nm
 	c.lb.mu.Unlock()

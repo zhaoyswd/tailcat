@@ -40,6 +40,8 @@ var wireFieldNames = map[string]string{
 	"s": "STUNPort",
 	"d": "DERPPort",
 	"x": "InsecureForTests",
+	"C": "Caps",
+	"B": "Build",
 }
 
 // TestWireFieldNames verifies that every field of every wire type

@@ -196,6 +196,68 @@ type ConnInfo struct {
 	// through DERP, and clients that know nothing of the field (older or
 	// upstream ones) ignore it. See endpointhint.go.
 	EndpointHints []EndpointHint `json:",omitempty"`
+
+	// Caps and Build advertise what optional features the build that
+	// generated this address has; see [Caps]. They exist so a client can
+	// tell an enhanced build from a plain one without probing: official
+	// builds and addresses generated before these fields existed leave
+	// them zero, which clients must read as "unknown build", not as a
+	// negative answer.
+	Caps  Caps   `json:",omitempty"`
+	Build string `json:",omitempty"`
+}
+
+// Caps is a bitmask of optional features advertised inside an [Addr].
+//
+// The bits describe the build that generated the address, not the
+// configuration it happens to be running with: a server with the agent
+// gateway compiled in but not serving files still advertises
+// [CapAgentGateway]. Use it to decide what an address can plausibly
+// support, and treat the zero value as "unknown/plain build".
+type Caps uint64
+
+const (
+	// CapUDPForward: the server forwards non-DNS UDP through the tunnel.
+	// The upstream CLI registers only OnTCPForward, so UDP flows (QUIC,
+	// game traffic) go nowhere there.
+	CapUDPForward Caps = 1 << iota
+
+	// CapAgentGateway: the server process embeds the agent gateway that
+	// codex/opencode sessions dial (fork v0.6.0-udp.15 and later).
+	CapAgentGateway
+
+	// CapFixedPort: the server supports --listen-port/--advertise-port
+	// and announces a stable public UDP endpoint (UPnP mapping or a
+	// manual one).
+	CapFixedPort
+
+	// CapProxyForward: the server supports --forward-via-proxy (and
+	// --forward-udp) for the traffic it forwards.
+	CapProxyForward
+)
+
+// Has reports whether c advertises f.
+func (c Caps) Has(f Caps) bool { return c&f != 0 }
+
+// String renders the advertised bits for logs, e.g. "udp-forward,agent-gateway".
+// An empty result means no bits are set (a plain or pre-existing address).
+func (c Caps) String() string {
+	names := []struct {
+		bit  Caps
+		name string
+	}{
+		{CapUDPForward, "udp-forward"},
+		{CapAgentGateway, "agent-gateway"},
+		{CapFixedPort, "fixed-port"},
+		{CapProxyForward, "proxy-forward"},
+	}
+	var b []string
+	for _, n := range names {
+		if c.Has(n.bit) {
+			b = append(b, n.name)
+		}
+	}
+	return strings.Join(b, ",")
 }
 
 // NodePublic is a wrapper around key.NodePublic just so we can have a slightly
@@ -366,6 +428,10 @@ type locoBackend struct {
 	serverHints  []netip.AddrPort
 	presharedKey PresharedKey
 	isServer     bool
+	// acceptDirectInitiators：见 Server.AcceptDirectInitiators。开时 magicsock 会为
+	// 「netmap 里不存在的对端 key」的入站握手建临时 endpoint 并回包（有上限、按空闲
+	// 过期），这是零 DERP 首连的服务端半边。
+	acceptDirectInitiators bool
 	// listenPort / advertisePort 来自 Server 配置（0 = 随机 / 由 UPnP 决定）。
 	listenPort    uint16
 	advertisePort uint16
@@ -502,6 +568,21 @@ type Server struct {
 	// probe-verified). It must be set before calling Start. See
 	// egressbind.go.
 	BindInterface string
+
+	// AcceptDirectInitiators, if non-nil, controls whether this server answers
+	// WireGuard handshakes from client keys it has not seen before (there is no
+	// control plane: a tailcat exit learns its clients from this handshake).
+	// Enabling it is what makes a DERP-free first connection possible — the
+	// client sends its handshake straight to an advertised endpoint and the
+	// server can both admit it and reply to the observed source address.
+	//
+	// Cryptographically nothing changes: the handshake still has to verify the
+	// pre-shared key from the tailcat address, and no peer becomes routable
+	// without it. What changes is that an unknown sender can make this server
+	// allocate a bounded, idle-expiring endpoint. Treat the address as a secret.
+	// nil (the zero value) means enabled, i.e. the recommended default for this
+	// build; set it to false to restore upstream behaviour.
+	AcceptDirectInitiators *bool
 
 	// Logf is the logger used for debug messages.
 	// If nil, log.Printf is used.
@@ -725,6 +806,7 @@ func (s *Server) startLocked(ctx context.Context) error {
 
 	lb.isServer = true
 	lb.listenPort = s.ListenPort
+	lb.acceptDirectInitiators = s.AcceptDirectInitiators == nil || *s.AcceptDirectInitiators
 	// 物理上行绑定：初始评估必须在 createEngine 之前同步完成（决定 netns 开关与解析）。
 	startEgressBind(lb, s.BindInterface)
 	lb.advertisePort = s.AdvertiseUDPPort
@@ -1126,6 +1208,8 @@ func (ci *ConnInfo) Addr() Addr {
 	w := &wireConnInfo{
 		ServerPublic: ci.ServerPublic,
 		RegionID:     ci.RegionID.Int64(),
+		Caps:         ci.Caps,
+		Build:        ci.Build,
 	}
 	if !ci.ServerDiscoPublic.IsZero() {
 		w.ServerDiscoPublic = &ci.ServerDiscoPublic
@@ -1229,6 +1313,8 @@ func ParseAddr(addr Addr) (ConnInfo, error) {
 	ci := ConnInfo{
 		ServerPublic: w.ServerPublic,
 		RegionID:     tailcfg.DERPRegionID(w.RegionID),
+		Caps:         w.Caps,
+		Build:        w.Build,
 	}
 	if w.ServerDiscoPublic != nil {
 		ci.ServerDiscoPublic = *w.ServerDiscoPublic
@@ -1746,6 +1832,27 @@ func (b *locoBackend) advertiseEndpoints() {
 	if len(eps) == 0 || len(peers) == 0 {
 		return
 	}
+	// 端口自洽过滤（2026-09-17 加，文档里那条修法①）：只通告**端口等于本机监听端口**的
+	// 公网映射。为什么需要：netcheck 的增量报告会携带「一次性探测 socket」学到的映射，
+	// 而那个 socket 的本地端口不是我们的常驻端口（实测出口 v4a 在 :24577 / :41641 之间交替，
+	// 24577 根本没有监听者）⇒ 对端学到的是一个死地址，蜂窝下表现为「时好时坏」。
+	// 判据只在**已知期望端口**时生效（--listen-port / 环境变量 / UPnP 拿到的端口）；
+	// 不知道期望端口时保守不动（免得把 NAT 改写端口的正常出口过滤掉）。
+	if want := b.pinnedEndpointPort(); want != 0 {
+		kept := eps[:0]
+		for _, ep := range eps {
+			a := ep.Addr()
+			if a.Is4() && !a.IsPrivate() && ep.Port() != want {
+				b.logf("advertise: 丢弃端口不自洽的公网候选 %v（期望端口 %d）", ep, want)
+				continue
+			}
+			kept = append(kept, ep)
+		}
+		eps = kept
+		if len(eps) == 0 {
+			return
+		}
+	}
 	payload := (&disco.CallMeMaybe{MyNumber: eps}).AppendMarshal(nil)
 	discoPriv := discoPrivateForNode(b.priv)
 	mc := b.sys.MagicSock.Get()
@@ -1777,6 +1884,25 @@ func (b *locoBackend) advertiseEndpoints() {
 			b.advertiseMu.Unlock()
 		}
 	}
+}
+
+// pinnedEndpointPort 返回本出口「公众应通过哪个 UDP 端口找到我们」的**已知期望端口**：
+// 显式配置的 advertisePort、固定的 listenPort、或 UPnP 拿到的外部映射端口。
+// 0 = 不知道（此时不做端口自洽过滤，保持历史行为 —— 免得把 NAT 改写端口的正常出口挡掉）。
+func (b *locoBackend) pinnedEndpointPort() uint16 {
+	if b.advertisePort != 0 {
+		return b.advertisePort
+	}
+	if advertisePort != 0 {
+		return advertisePort // 环境变量 TAILCAT_ADVERTISE_PORT
+	}
+	if b.listenPort != 0 {
+		return b.listenPort
+	}
+	b.mu.Lock()
+	mp := b.mappedPort // UPnP 自动拿到的外部端口
+	b.mu.Unlock()
+	return mp
 }
 
 // nodeHasAddr reports whether ip is one of n's tailcat addresses.
@@ -2060,6 +2186,15 @@ func createEngine(logf logger.Logf, lb *locoBackend) (err error) {
 	}
 	sys.Set(e)
 	sys.NetstackRouter.Set(true)
+	// PATCH(tier)：出口接受「netmap 里没有的 key」的直连握手（零 DERP 首连的服务端
+	// 半边）。magicsock 会为来包源地址建一个临时 endpoint（有上限、空闲过期），使
+	// wgcfg.NewPeerLookupFunc → Conn.ParseEndpoint 能建出 peer、握手响应也回得去。
+	// 准入凭据仍是 WG 握手里的 PSK，语义不变。
+	if lb.isServer && lb.acceptDirectInitiators {
+		if mc := sys.MagicSock.Get(); mc != nil {
+			mc.SetAcceptProvisionalInitiators(true)
+		}
+	}
 	return nil
 }
 
@@ -2374,6 +2509,16 @@ func (c *Client) ensureStarted(ctx context.Context) error {
 	}
 	if err := c.lb.Start(); err != nil {
 		return err
+	}
+	// PATCH(tier)：直连优先模式让**第一个 WireGuard 握手包**就走候选地址。
+	// 上游 addrForSendLocked 对「还没有已核实 bestAddr 的普通 peer」只给 DERP，
+	// 于是地址里的端点提示/学习端点在首包上没有用武之地 —— DERP 不可达时连握手
+	// 都发不出去（真机实测：首包被丢、5s 后重试，且那次也是在 meow 注册之后）。
+	// 打开后：有候选就同时发候选与 DERP；候选不可达时信任窗过期，行为回到现状。
+	if c.DirectConnect {
+		if mc := c.lb.sys.MagicSock.Get(); mc != nil {
+			mc.SetBootstrapCandidates(true)
+		}
 	}
 	c.started = true
 	return nil
