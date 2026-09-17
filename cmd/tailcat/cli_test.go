@@ -152,6 +152,31 @@ func TestParseFilesFlagWriteOnlyModes(t *testing.T) {
 	}
 }
 
+// TestParseFilesFlagEmptyDefault checks the fork default for an unset
+// --files: the user's home directory, read-write. When the home directory
+// cannot be determined it must fall back to the current directory,
+// read-only (upstream behavior).
+func TestParseFilesFlagEmptyDefault(t *testing.T) {
+	fs, modeName, err := parseFilesFlag("")
+	if err != nil {
+		t.Fatalf(`parseFilesFlag(""): %v`, err)
+	}
+	home, herr := os.UserHomeDir()
+	if herr == nil && home != "" {
+		if fs.Dir != home || fs.Mode != tailcat.FileServeRW || modeName != "read-write (default: home directory)" {
+			t.Errorf("parseFilesFlag(\"\") = {%q, %v}, %q; want {%q, %v}, read-write (default: home directory)", fs.Dir, fs.Mode, modeName, home, tailcat.FileServeRW)
+		}
+		return
+	}
+	wd, gerr := os.Getwd()
+	if gerr != nil {
+		t.Fatalf("Getwd: %v", gerr)
+	}
+	if fs.Dir != wd || fs.Mode != tailcat.FileServeRO {
+		t.Errorf("parseFilesFlag(\"\") = {%q, %v}; want cwd fallback {%q, read-only}", fs.Dir, fs.Mode, wd)
+	}
+}
+
 // parseCLI parses args against a fresh command tree and returns the
 // root command. It doesn't run anything. The command tree parses into
 // package-level flag variables, so tests that parse must not run in

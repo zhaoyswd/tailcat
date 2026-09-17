@@ -102,7 +102,7 @@ func newRootCommand() *ff.Command {
 	serveFS = ff.NewFlagSet("serve").SetParent(rootFS)
 	flagAllow = serveFS.StringLong("allow", "", "comma-separated list of public keys to allow access to the server, or 'none' to allow no clients. If empty, all clients are allowed.")
 	flagFullAddress = serveFS.BoolLong("full-address", "print a longer tailcat address with embedded DERP server info instead of a reference to a DERP map region ID. This lets clients connect more quickly, without a DERP map fetch.")
-	flagFiles = serveFS.StringLong("files", "", "directory to serve to SFTP clients (scp, sftp) with the 'files' service, with an optional :ro (read-only, the default), :rw (read-write), :wo (flat write-only drop box), or :wo+ (recursive write-only drop box) suffix. If empty, the current directory is served read-only. Giving --files implies the 'files' service.")
+	flagFiles = serveFS.StringLong("files", "", "directory to serve to SFTP clients (scp, sftp) with the 'files' service, with an optional :ro (read-only, the default for a given directory), :rw (read-write), :wo (flat write-only drop box), or :wo+ (recursive write-only drop box) suffix. If empty, the user's home directory is served read-write (fork default; falls back to the current directory, read-only, when the home directory cannot be determined). Giving --files implies the 'files' service.")
 	flagSSHAuthorizedKeys = serveFS.StringLong("ssh-authorized-keys", "", "comma-separated SSH public key sources for the 'ssh' service: authorized_keys file paths, literal OpenSSH public key lines, or names like 'alice@github' (fetched from https://github.com/alice.keys). All sources are loaded and validated at startup.")
 	flagPSK = serveFS.BoolLongDefault("psk", true, "include a WireGuard pre-shared key in the tailcat address (recommended). Set false only for shorter addresses and compatibility with tailcat clients v0.5.0 and earlier; this weakens security.")
 
@@ -445,16 +445,17 @@ to the same port on localhost. Service names are:
 	             $TAILCAT_PEER_KEY)
 	files        file server for SFTP clients like scp and sftp,
 	             rooted in the --files directory (default: the
-	             current directory, read-only)
+	             user's home directory, read-write)
 	exec         run the command given after "--" for each
 	             connection to any port not otherwise served, with
 	             the connection as the command's stdin and stdout
 	             (like inetd); its stderr is the server's
 
 With no arguments, the server serves exit-node,files: an exit node
-plus the file server for the current directory, read-only (this
-differs from upstream, where no arguments means one-shot stdout
-mode; in this fork that mode is only reachable by running tailcat
+plus the file server for the user's home directory, read-write (this
+differs from upstream twice: there, no arguments means one-shot stdout
+mode, and the file server defaults to the current directory, read-only;
+the one-shot mode is only reachable in this fork by running tailcat
 with no subcommand at all). Giving --files overrides the served
 directory and mode.
 
@@ -830,6 +831,26 @@ func newClient(logf logger.Logf, addr tailcat.Addr, priv key.NodePrivate) *tailc
 	return cl
 }
 
+// clientReady performs the pre-dial readiness handshake and returns a line for
+// the caller's logging. In direct-connect mode it must go through
+// Client.Ready (mode-aware: the TSMP probe races the background meow); a plain
+// Client.Ping would latch upDone and pin the rest of the run to the meow path,
+// silently defeating --direct-connect (2026-09-17 review).
+func clientReady(cl *tailcat.Client) (string, error) {
+	if cl.DirectConnect {
+		by, err := cl.Ready(context.Background())
+		if err != nil {
+			return "", err
+		}
+		return "ready by " + by, nil
+	}
+	pi, err := cl.Ping(context.Background())
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("got ping: %+v", pi), nil
+}
+
 // derpMapCache implements [tailcat.DERPMapCache] on disk, in
 // $XDG_CACHE_HOME/tailcat (~/.cache/tailcat on Linux). Each DERP map
 // URL gets a derpmap-<url-escaped-URL>.json file whose mtime is the
@@ -941,12 +962,12 @@ func clientMode(logf logger.Logf, connStr, optDest string) error {
 		dial = func(ctx context.Context) (net.Conn, error) { return cl.DialTCP(ctx, addrPort) }
 	}
 
-	pi, err := cl.Ping(context.Background())
+	msg, err := clientReady(cl)
 	if err != nil {
-		log.Fatalf("tailcat Ping: %v", err)
+		log.Fatalf("tailcat ready: %v", err)
 	}
 	if *flagVerbose {
-		logf("got ping: %+v", pi)
+		logf("%s", msg)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1036,11 +1057,11 @@ func clientSOCKSMode(logf logger.Logf, listen string, args []string) error {
 	var cl *tailcat.Client
 	if addr != "" {
 		cl = newClient(logf, addr, clientPriv)
-		pi, err := cl.Ping(context.Background())
+		msg, err := clientReady(cl)
 		if err != nil {
-			log.Fatalf("tailcat Ping: %v", err)
+			log.Fatalf("tailcat ready: %v", err)
 		}
-		logf("got ping: %+v", pi)
+		logf("%s", msg)
 	}
 
 	var clientsMu sync.Mutex
@@ -1637,9 +1658,11 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 }
 
 // parseFilesFlag parses the --files flag value: a directory with an
-// optional :ro, :rw, :wo, or :wo+ suffix. An empty value means the current
-// directory, read-only. It returns the file service and the mode's
-// human-readable name.
+// optional :ro, :rw, :wo, or :wo+ suffix. An unset or empty value means the
+// user's home directory, read-write (fork default; upstream serves the
+// current directory, read-only, and this fork falls back to that when the
+// home directory cannot be determined). It returns the file service and
+// the mode's human-readable name.
 func parseFilesFlag(v string) (*tailcat.FileService, string, error) {
 	mode, modeName := tailcat.FileServeRO, "read-only"
 	dir := v
@@ -1654,6 +1677,18 @@ func parseFilesFlag(v string) (*tailcat.FileService, string, error) {
 	}
 	if dir == "" {
 		dir = "."
+	}
+	if v == "" {
+		// 本 fork 默认（2026-09-17）：没传 --files 时服务用户主目录并开放写
+		// （tier App 的文件管理与 agent 项目目录都以「根=home、可写」为前提，
+		// 且不依赖 serve 从哪个目录启动）。HOME 解析不到（无 HOME 的容器等）
+		// 退回上游行为：当前目录、只读。
+		if home, herr := os.UserHomeDir(); herr == nil && home != "" {
+			dir = home
+			mode, modeName = tailcat.FileServeRW, "read-write (default: home directory)"
+		} else {
+			modeName = "read-only (home lookup failed; fell back to current directory)"
+		}
 	}
 	abs, err := filepath.Abs(dir)
 	if err != nil {

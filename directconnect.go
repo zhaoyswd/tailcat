@@ -1,21 +1,25 @@
 // directconnect.go — 客户端直连优先建连（openspec change
 // direct-handshake-connect）。
 //
-// 机制（2026-09-17 按 review 修订定稿）：地址带未过期候选（hint 或学习
-// 端点）且 DirectConnect 开启时，就绪不再以 meowed 为串行门槛——TSMP
-// 探针与后台 meow **赛跑**，谁先成功谁就算就绪：
-//   - 服务端懒注册（peerConfig 放行）让 WireGuard 握手不依赖 meow 先行
-//     到达，探针（握手隐含在首个出站包里 + TSMP 往返）可在 meow 之前完成；
-//   - 官方（无懒注册的）服务端上探针握手被丢，meow 赢得赛跑——**不多付
-//     任何等待**（旧实现顺序探测 3×1s 再回落，官方出口白等 3s，已修）；
+// 机制（2026-09-17 二轮 review 修订定稿）：地址带未过期候选（hint 或学习
+// 端点）且 DirectConnect 开启时，就绪不再以 meowed 为**串行**门槛——TSMP
+// 探针与后台 meow 真并发赛跑（多路 select 同权等待，谁先成谁算就绪）：
+//   - 服务端懒注册（peerConfig 放行）让 WireGuard 握手不必等 meow 先到；
+//   - 官方（无懒注册的）服务端上探针握手被丢，meow 赢得赛跑——不多付任何
+//     探测等待（旧实现顺序探测 3×1s 再回落，官方出口白等 3s，已修）；
 //   - meow 完成后服务端拿到本机 disco key 注册，kickDisco 立刻促直连
 //     切换（hint 候选经 disco pong 成为 bestAddr）。
+//
+// ⚠️ 收益口径（按真机实测校准，别照 proposal 的旧话术引用）：健康路径上
+// 就绪判据**通常仍是 meow**——meow 是 1 个中继 RTT、探针要 2 个（握手 1 +
+// TSMP 1）且 meow 先发。所以本机制实际省下的是「首个数据流不再单独付一次
+// 握手 RTT」（握手已与 meow 并行完成），外加「meow 首包丢失时不至于卡死
+// 就绪」。**不是**「就绪不再含一个中继往返」，也**不是**「首个包不经 DERP」。
 //
 // 已知边界（诚实声明）：非 WireGuard-only peer 的**首个握手包本身走 DERP**
 // （magicsock addrForSendLocked 对无 bestAddr 的普通 peer 只给 derpAddr），
 // 所以 DERP 完全不可达时握手与 meow 一起失败——「DERP 不可用即连不上」
-// 没有被本 change 解决；实际收益是「就绪不再串行多等一个中继往返 +
-// 注册后立刻促直连」。零中继首跳的 WireGuard-only 形态在 wireguard-go
+// 没有被本 change 解决。零中继首跳的 WireGuard-only 形态在 wireguard-go
 // 深处存在未定位的握手静默失败，未启用（现象记录见 PATCHES §2.8）。
 package tailcat
 
@@ -28,19 +32,27 @@ import (
 	"tailscale.com/tailcfg"
 )
 
-// 直连就绪探测预算。注意蜂窝中继路径 RTT 600–750ms，1s 的单次窗口对
-// 「握手 2×RTT + TSMP 1×RTT」并不宽裕——首次尝试超时是预期内的情况，
-// 靠重试兜底；赛跑的另一条腿（meow）通常在官方出口上更快到达。
+// 直连就绪探测预算：单次尝试 1s（内部自带超时），两次尝试之间再歇 1s，
+// 共 attempts 次。⚠️ 蜂窝中继路径 RTT 600–750ms，而探针要「握手 + TSMP」
+// 两个往返，单次 1s 的窗口并不宽裕——首次超时属预期内，靠重试兜底；
+// 赛跑改写后这些参数只影响探针腿，meow 腿任何时刻成即刻就绪。
 const (
 	directProbeAttempt  = time.Second
 	directProbeAttempts = 3
 )
 
-// meow 后台补注册的节奏与预算（b2 形态）。
+// meow 后台补注册的节奏与预算（b2 形态）：budget 内 ping() 自带每秒重发，
+// 仍不成则转慢节奏低频重试（meowBgSlowInterval），而不是就此放弃。
+//
+// 慢节奏的理由：meow 是**直连路径的唯一前提**——服务端要靠它拿到本机
+// disco key 才会回应 disco ping。若快节奏全败而探针已就绪，本世代会停在
+// 「数据面可用但从未注册」：拿不到直连，且换网时就地重绑的判据
+// （Client.DiscoPing）永远失败 ⇒ 每次网络变化都落回整套重建。低频重试让
+// 这种状态在 30s 内自愈；持续 DERP 故障下它也只是每 30s 一个包。
+// 成功或 Client.Close（bgDone）即退出，不跨世代存活。
 const (
-	meowBgAttempts = 3
-	meowBgInterval = time.Second
-	meowBgBudget   = 15 * time.Second
+	meowBgBudget       = 15 * time.Second
+	meowBgSlowInterval = 30 * time.Second
 )
 
 // PingDirect 是直连优先模式的就绪探测：后台 meow 与 TSMP 探针赛跑，
@@ -90,35 +102,69 @@ func (c *Client) readyBy() string {
 	return ""
 }
 
-// raceReady runs the TSMP probe attempts against the background meow
-// registration; first success wins. If the probe exhausts its attempts and
-// meow hasn't landed either, it keeps waiting on meowWait until the parent
-// context is done.
+// raceReady 启动后台 meow 注册并跑赛跑核心（raceFirst）。
 func (c *Client) raceReady(ctx context.Context) (string, error) {
 	c.startMeowBackground()
-	for range directProbeAttempts {
-		select {
-		case <-c.meowWait:
-			return "meow", nil
-		default:
+	by, err := raceFirst(ctx, c.meowWait, c.probeTSMP, directProbeAttempts, directProbeAttempt, func() {
+		c.lb.logf("connect: 探针 %d×%v 未成→meow（直连腿出局，等会合）", directProbeAttempts, directProbeAttempt)
+	})
+	if by == "direct" {
+		c.lb.logf("connect: 直连探针先成就绪（meow 仍在后台补注册）")
+	}
+	return by, err
+}
+
+// raceFirst 是赛跑核心（与具体的探测手段解耦，便于单测）：meow 到达与 probe
+// 成功被**同权**等待——探针在飞期间 meow 到达也立刻就绪。
+// ⚠️ 第一版把 probe 同步写在循环体里，meow 只能在探针窗口的边界被观察到，
+// 最坏白等一个窗口（1s）；本函数就是那次 review 的修法。
+//
+// 结果：meow 先成 → "meow"；probe 先成 → "direct"；probe 用尽 attempts 次仍
+// 不成 → 探针腿出局（回调 onProbeExhausted，可 nil），只剩 meow 一条腿，
+// 等到 ctx 到点（= 旧路径「无条件等 meowed」的语义）。
+func raceFirst(ctx context.Context, meow <-chan struct{}, probe func(context.Context) error, attempts int, window time.Duration, onProbeExhausted func()) (string, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel() // 返回即掐掉还可能发着探针的 goroutine
+
+	probeOK := make(chan struct{}, 1)
+	probeOut := make(chan struct{})
+	go func() {
+		for range attempts {
+			if ctx.Err() != nil {
+				return
+			}
+			if err := probe(ctx); err == nil {
+				probeOK <- struct{}{} // 缓冲 1：调用方已返回也不会阻塞
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(window):
+			}
 		}
-		if err := c.probeTSMP(ctx); err == nil {
+		close(probeOut)
+	}()
+
+	for {
+		select {
+		case <-meow:
+			return "meow", nil
+		case <-probeOK:
 			return "direct", nil
-		}
-		select {
-		case <-c.meowWait:
-			return "meow", nil
+		case <-probeOut:
+			if onProbeExhausted != nil {
+				onProbeExhausted()
+			}
+			select {
+			case <-meow:
+				return "meow", nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case <-time.After(directProbeAttempt):
 		}
-	}
-	c.lb.logf("connect: hint-miss→meow（直连探测 %d×%v 未成，等 meow 会合）", directProbeAttempts, directProbeAttempt)
-	select {
-	case <-c.meowWait:
-		return "meow", nil
-	case <-ctx.Done():
-		return "", ctx.Err()
 	}
 }
 
@@ -155,7 +201,7 @@ func (c *Client) probeTSMP(parent context.Context) error {
 
 // startMeowBackground launches the async meow registration with an in-flight
 // latch: failures don't latch meowedOnce, but a Dial storm must not spawn
-// parallel 15s-budget goroutines (one at a time).
+// parallel registration goroutines (one at a time).
 func (c *Client) startMeowBackground() {
 	if c.meowedOnce.Load() || !c.meowInFlight.CompareAndSwap(false, true) {
 		return
@@ -166,41 +212,62 @@ func (c *Client) startMeowBackground() {
 	}()
 }
 
-// meowBackground performs the async meow registration (b2): a few bounded
-// retries, result logged only. Exits early when the client is closed (bgDone)
-// so it never outlives its generation (AGENTS 坑 26/26b 的世代教训).
-// On success it does NOT call advertiseEndpoints: the client's onMeowed
-// callback (initLocked) already does — 旧版这里重复调过一次（review 指出）。
+// meowBackground 是后台补注册：快节奏一段（预算内 Client.ping 自带重发），
+// 不成则转慢节奏低频重试，直到成功或 client 收工（bgDone）。不「首段失败即
+// 放弃」的理由见 meowBgSlowInterval 的说明。
+// 成功后不再调 advertiseEndpoints：客户端 onMeowed 回调（initLocked）已经
+// 调过——旧版这里重复调过一次（review 指出）。
 func (c *Client) meowBackground() {
 	if c.meowedOnce.Load() {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), meowBgBudget)
-	defer cancel()
-	for range meowBgAttempts {
+	if err := c.meowAttempt(meowBgBudget); err == nil {
+		c.meowRegistered()
+		return
+	}
+	select {
+	case <-c.bgDone:
+		return
+	default:
+	}
+	c.lb.logf("connect: meow 快节奏注册未成（%v 预算耗尽），转慢节奏重试（每 %v）——直连路径依赖注册",
+		meowBgBudget, meowBgSlowInterval)
+	for {
 		select {
 		case <-c.bgDone:
 			return
-		default:
+		case <-time.After(meowBgSlowInterval):
 		}
-		if _, err := c.ping(ctx); err == nil {
-			c.meowedOnce.Store(true)
-			// meowed 到达即满足旧路径的就绪语义（赛跑的另一条腿在等它）。
-			c.upDone.Store(true)
-			c.lb.logf("connect: meow 注册完成（出口动态通告通道就绪）")
-			go c.kickDisco()
+		if err := c.meowAttempt(meowBgBudget); err == nil {
+			c.meowRegistered()
 			return
-		}
-		select {
-		case <-c.bgDone:
-			return
-		case <-ctx.Done():
-			c.lb.logf("connect: meow 异步注册未成（预算耗尽），懒注册数据面不受影响")
-			return
-		case <-time.After(meowBgInterval):
 		}
 	}
-	c.lb.logf("connect: meow 异步注册未成（DERP 不可达或出口无响应），懒注册数据面不受影响")
+}
+
+// meowAttempt 做一段注册尝试（Client.ping 内部每秒重发），预算 timeout；
+// 期间 client 收工（bgDone）会被立刻打断，不必等预算耗尽。
+func (c *Client) meowAttempt(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	go func() {
+		select {
+		case <-c.bgDone:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	_, err := c.ping(ctx)
+	return err
+}
+
+// meowRegistered 是注册成功的收尾：闩住、满足旧路径的就绪语义（赛跑的另一
+// 条腿还在等 meowWait）、促一次直连切换。
+func (c *Client) meowRegistered() {
+	c.meowedOnce.Store(true)
+	c.upDone.Store(true)
+	c.lb.logf("connect: meow 注册完成（出口拿到本机 disco key，促直连切换）")
+	go c.kickDisco()
 }
 
 // kickDisco sends one disco ping to the server so hint candidates can become

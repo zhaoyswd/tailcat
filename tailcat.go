@@ -354,9 +354,9 @@ type locoBackend struct {
 	serverDiscoPub key.DiscoPublic // non-zero if we're a client (server's disco key)
 
 	// directFirst（仅客户端）：直连优先建连模式（openspec
-	// direct-handshake-connect）：meow 转后台异步、就绪判据是 TSMP 探测
-	// （WireGuard 握手经 server 懒注册放行，不依赖 meow 到达）、meow 完成
-	// 后主动 disco 促直连切换。见 directconnect.go。
+	// direct-handshake-connect）：TSMP 探针与后台 meow **赛跑**、谁先成谁算
+	// 就绪（WireGuard 握手经 server 懒注册放行，不必等 meow 先到）、meow
+	// 完成后主动 disco 促直连切换。见 directconnect.go。
 	directFirst atomic.Bool
 
 	// serverHints 是地址端点提示里**未过期**的直连候选（仅客户端）。
@@ -2135,7 +2135,7 @@ type Client struct {
 	key     key.NodePrivate // the effective node identity; Key or generated
 	started bool
 
-	upDone atomic.Bool // whether the server has meowed us at least once
+	upDone atomic.Bool // 就绪闩锁：meow 注册或直连探针任一到过（见 directconnect.go；旧语义仅 meowed）
 }
 
 // nodeKeyLocked returns the client's effective node private key,
@@ -2389,7 +2389,7 @@ func (c *Client) up(ctx context.Context) error {
 		return nil
 	}
 	// 先启动再判模式：首次调用时 c.lb 还没建（initLocked 在 ensureStarted
-	// 里跑、serverWGOnly 也是那时才置位），先判断会永远走普通路径。
+	// 里跑、directFirst 也是那时才置位），先判断会永远走普通路径。
 	if err := c.ensureStarted(ctx); err != nil {
 		return err
 	}
