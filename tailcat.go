@@ -210,10 +210,9 @@ type ConnInfo struct {
 // Caps is a bitmask of optional features advertised inside an [Addr].
 //
 // The bits describe the build that generated the address, not the
-// configuration it happens to be running with: a server with the agent
-// gateway compiled in but not serving files still advertises
-// [CapAgentGateway]. Use it to decide what an address can plausibly
-// support, and treat the zero value as "unknown/plain build".
+// configuration it happens to be running with. Use it to decide what an
+// address can plausibly support, and treat the zero value as
+// "unknown/plain build".
 type Caps uint64
 
 const (
@@ -222,9 +221,11 @@ const (
 	// game traffic) go nowhere there.
 	CapUDPForward Caps = 1 << iota
 
-	// CapAgentGateway: the server process embeds the agent gateway that
-	// codex/opencode sessions dial (fork v0.6.0-udp.15 and later).
-	CapAgentGateway
+	// Bit 1 is retired: it used to be CapAgentGateway (the embedded agent
+	// gateway, removed 2026-09-17). It must never be reused — addresses
+	// issued while the feature existed still carry it, and clients must
+	// keep decoding the remaining bits the same way.
+	_ Caps = 1 << iota
 
 	// CapFixedPort: the server supports --listen-port/--advertise-port
 	// and announces a stable public UDP endpoint (UPnP mapping or a
@@ -239,7 +240,7 @@ const (
 // Has reports whether c advertises f.
 func (c Caps) Has(f Caps) bool { return c&f != 0 }
 
-// String renders the advertised bits for logs, e.g. "udp-forward,agent-gateway".
+// String renders the advertised bits for logs, e.g. "udp-forward,fixed-port".
 // An empty result means no bits are set (a plain or pre-existing address).
 func (c Caps) String() string {
 	names := []struct {
@@ -247,7 +248,6 @@ func (c Caps) String() string {
 		name string
 	}{
 		{CapUDPForward, "udp-forward"},
-		{CapAgentGateway, "agent-gateway"},
 		{CapFixedPort, "fixed-port"},
 		{CapProxyForward, "proxy-forward"},
 	}
@@ -435,6 +435,8 @@ type locoBackend struct {
 	// listenPort / advertisePort 来自 Server 配置（0 = 随机 / 由 UPnP 决定）。
 	listenPort    uint16
 	advertisePort uint16
+	// listenPortWarnOnce 保证「配置端口没拿到、已回退随机」只记一次（诊断用，2026-09-17）。
+	listenPortWarnOnce sync.Once
 
 	// mappedPort 是 UPnP 为 magicsock 的 UDP 端口拿到的**外部端口**（0 = 没拿到）。
 	// onEngineStatus 会连同它一起把「公网 IP:该端口」通告给对端 —— 对端于是有一个
@@ -1887,7 +1889,7 @@ func (b *locoBackend) advertiseEndpoints() {
 }
 
 // pinnedEndpointPort 返回本出口「公众应通过哪个 UDP 端口找到我们」的**已知期望端口**：
-// 显式配置的 advertisePort、固定的 listenPort、或 UPnP 拿到的外部映射端口。
+// 显式配置的 advertisePort、固定的 listenPort（取**实际绑定值**）、或 UPnP 拿到的外部映射端口。
 // 0 = 不知道（此时不做端口自洽过滤，保持历史行为 —— 免得把 NAT 改写端口的正常出口挡掉）。
 func (b *locoBackend) pinnedEndpointPort() uint16 {
 	if b.advertisePort != 0 {
@@ -1897,12 +1899,41 @@ func (b *locoBackend) pinnedEndpointPort() uint16 {
 		return advertisePort // 环境变量 TAILCAT_ADVERTISE_PORT
 	}
 	if b.listenPort != 0 {
+		// 2026-09-17（openspec exit-defaults）：判据取**实际绑定端口**，不再取配置值。
+		// 默认端口固定之后，配置端口可能因被别的进程占用而由 magicsock 静默回退到随机端口；
+		// 若仍拿配置值当判据，端口自洽过滤会把真实候选**全部丢掉**、只通告一个没人监听的地址
+		// ——比不做过滤更糟。实际值拿不到时保守退回配置值（旧行为）。
+		if p := b.boundUDPPort(); p != 0 {
+			return p
+		}
 		return b.listenPort
 	}
 	b.mu.Lock()
 	mp := b.mappedPort // UPnP 自动拿到的外部端口
 	b.mu.Unlock()
 	return mp
+}
+
+// boundUDPPort 返回 magicsock **实际**绑定的本地 UDP 端口（0 = 还拿不到）。
+// 与配置值不一致时记一行日志：默认端口固定后，这通常意味着端口被占用、已回退随机。
+func (b *locoBackend) boundUDPPort() uint16 {
+	mc := b.sys.MagicSock.Get()
+	if mc == nil {
+		return 0
+	}
+	p := mc.LocalPort()
+	if p == 0 {
+		return 0
+	}
+	if uint16(b.listenPort) != p {
+		b.listenPortWarnOnce.Do(func() {
+			// 打 stderr 而不是 logf：这条必须「响亮」——logf 只在 --verbose 时才输出，
+			// 而端口回退是会影响用户防火墙/映射规则的事实，安静链路上也得看得见。
+			fmt.Fprintf(os.Stderr, "# listen-port %d 未取得（被别的进程占用？），已回退到随机端口 %d；"+
+				"按固定端口配置的路由器/防火墙/代理规则需要更新\n", b.listenPort, p)
+		})
+	}
+	return p
 }
 
 // nodeHasAddr reports whether ip is one of n's tailcat addresses.
@@ -1929,6 +1960,20 @@ func (lb *locoBackend) Start() error {
 	e := lb.sys.Engine.Get()
 	mc := lb.sys.MagicSock.Get()
 	lb.logf("disco pub key: %v", mc.DiscoPublicKey())
+
+	// 默认端口固定后（openspec exit-defaults），配置端口可能被别的进程占用、magicsock 会静默
+	// 回退到随机端口。这里在启动期主动核一次「配置 vs 实际」，把回退**当场**记进日志，
+	// 而不是等到第一个对端出现、advertiseEndpoints 被调用时才记（安静的出口上否则永远看不到）。
+	if lb.isServer && lb.listenPort != 0 {
+		go func() {
+			for i := 0; i < 50; i++ { // 最多等 ~5s（等 magicsock 绑好端口）
+				if lb.boundUDPPort() != 0 {
+					return
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}()
+	}
 
 	mc.SetPrivateKey(lb.priv)
 	mc.SetDERPMap(lb.dm)

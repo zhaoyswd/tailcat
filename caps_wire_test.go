@@ -31,7 +31,7 @@ func TestCapsRoundTrip(t *testing.T) {
 	// An enhanced build's address must round-trip its advertisement, and the
 	// bits must survive the parse/encode cycle clients do (Resolve, hint
 	// updates) unchanged.
-	ci.Caps = CapUDPForward | CapAgentGateway
+	ci.Caps = CapUDPForward | CapFixedPort | CapProxyForward
 	ci.Build = "udp.18"
 	addr := ci.Addr()
 	back, err := ParseAddr(addr)
@@ -51,20 +51,31 @@ func TestCapsRoundTrip(t *testing.T) {
 
 func TestCapsHasAndString(t *testing.T) {
 	var c Caps
-	if c.Has(CapAgentGateway) {
-		t.Error("zero Caps advertises agent gateway")
+	if c.Has(CapUDPForward) {
+		t.Error("zero Caps advertises UDP forwarding")
 	}
 	if s := c.String(); s != "" {
 		t.Errorf("zero Caps String() = %q; want empty", s)
 	}
-	c = CapAgentGateway | CapFixedPort
-	if !c.Has(CapAgentGateway) || !c.Has(CapFixedPort) {
+	c = CapUDPForward | CapFixedPort
+	if !c.Has(CapUDPForward) || !c.Has(CapFixedPort) {
 		t.Errorf("%v is missing bits it was built from", c)
 	}
-	if c.Has(CapUDPForward) {
+	if c.Has(CapProxyForward) {
 		t.Errorf("%v claims a bit it was not given", c)
 	}
-	if s, want := c.String(), "agent-gateway,fixed-port"; s != want {
+	if s, want := c.String(), "udp-forward,fixed-port"; s != want {
 		t.Errorf("String() = %q; want %q", s, want)
+	}
+	// Bit 1 is retired (was CapAgentGateway, removed 2026-09-17) and must stay
+	// unassigned: addresses issued while the feature existed still carry it,
+	// so reusing the bit would silently change how old addresses decode.
+	if CapFixedPort != 1<<2 || CapProxyForward != 1<<3 {
+		t.Errorf("retired bit 1 was reused: fixed-port=%b proxy-forward=%b", CapFixedPort, CapProxyForward)
+	}
+	// A legacy address with the retired bit set keeps decoding its other bits.
+	legacy := Caps(1<<1) | CapFixedPort
+	if legacy.String() != "fixed-port" {
+		t.Errorf("legacy caps String() = %q; want %q", legacy.String(), "fixed-port")
 	}
 }

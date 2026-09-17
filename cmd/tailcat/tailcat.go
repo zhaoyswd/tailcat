@@ -438,6 +438,11 @@ to the same port on localhost. Service names are:
 
 	all          serve all ports
 	exit-node    run an exit node for all addresses
+	             (also provides the terminal service on virtual
+	             port 7724 in this fork; see FORK-NOTES section 9)
+	term         accepted as a readable alias: the terminal service
+	             comes with exit-node, so this only makes the service
+	             list self-documenting
 	ssh          SSH server requiring a public key listed by
 	             --ssh-authorized-keys
 	no-auth-ssh  auth-free SSH server (the tunnel provides identity;
@@ -1262,6 +1267,28 @@ func splitExecArgs(args []string) (positional, execArgs []string) {
 	return positional, execArgs
 }
 
+// applyForkServiceDefaults 把本 fork「默认打开」的服务补进服务集（2026-09-17，openspec
+// exit-defaults）：**exit-node 隐式带 files**——增强版能力装上就有，用户不必再列服务名、
+// 也不必记 --files。返回是否**自动**添加了 files（供「Serving files …」那行标注）。
+//
+// 不生效的四种情况：服务集为空 / 没有 exit-node / 已经显式带 files / TAILCAT_FILES=off
+// （环境变量逃生开关，不引入 CLI 认知负担；显式写 files 的部署不受它影响）。
+// 另外，本构建不含 SSH 支持时（ts_omit_ssh）也不自动加，并留一行说明。
+func applyForkServiceDefaults(services set.Set[string], logf logger.Logf) (autoFiles bool) {
+	if services == nil || !services.Contains("exit-node") || services.Contains("files") {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("TAILCAT_FILES")), "off") {
+		return false
+	}
+	if !tailCatSSHEnabled {
+		logf("files: 本构建不含 SSH 支持，跳过随 exit-node 自动开启的文件服务")
+		return false
+	}
+	services.Add("files")
+	return true
+}
+
 // server runs a tailcat server. execArgs is the command given after
 // "--", or nil.
 func server(logf logger.Logf, serveSpec string, execArgs []string) {
@@ -1295,6 +1322,14 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 			services = set.Set[string]{}
 		}
 		services.Add("files")
+	}
+	// 本 fork 的默认（2026-09-17，与终端服务同批，openspec exit-defaults）：exit-node 隐式带
+	// files。规则与逃生开关都在 applyForkServiceDefaults 里（有单测）。
+	filesAutoAdded := applyForkServiceDefaults(services, logf)
+	// 'term' 只是「可读性 / 排障」用的服务名：终端服务本身随 exit-node 自动开（openspec
+	// exit-terminal），单独写 term 没有任何意义 —— 明确报错，别让用户对着一个空服务端发呆。
+	if services.Contains("term") && !services.Contains("exit-node") {
+		log.Fatal("the 'term' service is provided together with 'exit-node'; add 'exit-node' to the service list")
 	}
 	sshWithAuth := services.Contains("ssh")
 	sshWithoutAuth := services.Contains("no-auth-ssh")
@@ -1421,15 +1456,6 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	if err := setupForwarding(reg); err != nil {
 		log.Fatal(err)
 	}
-	// Agent-gateway（tier App 的 opencode/codex 远程会话翻译层）：常驻回环监听、按需拉起
-	// 后端，全部实现在 agentgateway*.go 独立文件；失败不影响 serve。
-	// filesRoot 用于把 App 传来的 files 服务 SFTP 沙箱路径换算成宿主绝对路径
-	//（os.Root 不暴露根位置，只有同进程的我们知道）。
-	gwFilesRoot := ""
-	if fs, _, ferr := parseFilesFlag(*flagFiles); ferr == nil && fs != nil {
-		gwFilesRoot = fs.Dir
-	}
-	go startAgentGateway(logger.WithPrefix(logf, "[agent-gateway] "), gwFilesRoot)
 	s := &tailcat.Server{Key: priv, PresharedKey: psk, DisablePresharedKey: !usePSK, Logf: logf, Region: reg}
 	if p := listenPortFlag(); p > 0 && p < 65536 {
 		s.ListenPort = uint16(p)
@@ -1533,7 +1559,11 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 				log.Fatal(err)
 			}
 			opts.Files = fsrv
-			fmt.Fprintf(os.Stderr, "# Serving files from %v (%v)\n", fsrv.Dir, modeName)
+			auto := ""
+			if filesAutoAdded {
+				auto = " [auto: with exit-node; TAILCAT_FILES=off disables]"
+			}
+			fmt.Fprintf(os.Stderr, "# Serving files from %v (%v)%s\n", fsrv.Dir, modeName, auto)
 		}
 		sshHandler = s.SSHConnHandler(opts)
 	}
@@ -1544,7 +1574,27 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		fmt.Fprintf(os.Stderr, "# Running %v for each connection\n", strings.Join(execArgs, " "))
 	}
 
+	// 终端服务（openspec exit-terminal）：只要服务里有 exit-node 就默认开、零旗标。
+	// 它跑在**隧道内虚拟端口**上（默认 7724），不占出口主机的物理端口；
+	// 关掉用 TAILCAT_TERM=off；调参走 TAILCAT_TERM_*（见 term_service.go）。
+	var termSrv *termService
+	if services.Contains("exit-node") {
+		if !termPlatformSupported() {
+			logf("terminal service not supported on this platform; continuing without it")
+		} else if termDisabledByEnv() {
+			logf("terminal service disabled by TAILCAT_TERM=off")
+		} else {
+			termSrv = newTermService(logf)
+			fmt.Fprintf(os.Stderr, "# Serving terminal sessions on port %d (shell=%s, history=%s)\n",
+				termSrv.Port(), termSrv.ShellText(), termSrv.HistoryText())
+			defer termSrv.Close()
+		}
+	}
+
 	s.OnTCP = func(port uint16) (handler func(net.Conn)) {
+		if termSrv != nil && port == termSrv.Port() {
+			return termSrv.ServeConn
+		}
 		if port == 22 && sshHandler != nil {
 			return sshHandler
 		}
@@ -1738,9 +1788,14 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], _ 
 		case "exit-node", "exec":
 			services.Add(r)
 			continue
+		case "term":
+			// 终端服务随 exit-node 自动开（openspec exit-terminal）；这里接受这个名字只是为了
+			// 让 `serve exit-node,term` 这种写法可读、可排障。单独写 term 会在 serve 里被拒。
+			services.Add(r)
+			continue
 		}
 		if !numRx.MatchString(r) && !portRangeRx.MatchString(r) {
-			return nil, nil, fmt.Errorf("%q is not a known named service (want one of: all, ssh, no-auth-ssh, files, exec, exit-node)", r)
+			return nil, nil, fmt.Errorf("%q is not a known named service (want one of: all, ssh, no-auth-ssh, files, exec, exit-node, term)", r)
 		}
 		a, b := r, ""
 		if portRangeRx.MatchString(r) {

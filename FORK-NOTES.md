@@ -42,20 +42,51 @@
 不过它还没进任何上游发行版（最新 release 仍是 v0.6.0），所以本 fork 目前继续带着这段补丁 —— 等下一个上游 tag
 之后就能回到官方版。
 
-### 2. 新增 `--listen-port`：把本地 UDP 端口固定下来（默认仍是随机）
+### 2. 本地 UDP 端口固定为 41641（`--listen-port`，**默认开启**；可关）
 
 **问题**：出口的 UDP 端口每次启动都随机。所有「按端口写的规则」都指望不上：
 路由器端口映射、防火墙放行、本机代理分流，重启一次就全部失效。
 
-**用法**：
+**现在的默认**：`--listen-port` 不填时用 **41641**（本 fork 的默认值，2026-09-17 起）。
+也就是说 `tailcat serve --key=exit.key exit-node` 开箱即有一个可写进规则的固定端口。
 
 ```bash
-tailcat --listen-port=41641 serve --key=exit.key exit-node
-# 等价的环境变量（命令行优先）：
-TAILCAT_LISTEN_PORT=41641 tailcat serve --key=exit.key exit-node
+# 默认即是 41641，不用传参
+tailcat serve --key=exit.key exit-node
+
+# 想换端口 / 想回到上游的「每次随机」：
+tailcat --listen-port=45711 serve --key=exit.key exit-node
+TAILCAT_LISTEN_PORT=0 tailcat serve --key=exit.key exit-node     # 0 = 随机
 ```
 
 端口建议选在 `32768–60999`（Linux 临时端口池）**之外**，避免与系统自己分配的端口撞车。
+`TAILCAT_LISTEN_PORT` 环境变量仍可作默认值（命令行优先）。
+
+**端口被占用时**：服务**照常启动**（magicsock 自动回退到随机端口），并打一行**始终可见**的
+stderr 警告（不需要 `--verbose`）：
+
+```
+# listen-port 41641 未取得（被别的进程占用？），已回退到随机端口 53489；按固定端口配置的路由器/防火墙/代理规则需要更新
+```
+
+同时「端口自洽过滤」（只把端口等于本机监听端口的公网候选通告给对端，防对端学到死地址）改用
+**实际绑定端口**做判据——否则端口被占时会反过来把真实候选全丢掉。
+
+### 2b. `exit-node` 隐式带文件服务（默认开启；可关）
+
+**问题**：文件服务（SFTP over tailcat）以前必须显式写进服务列表（`serve exit-node,files`）
+或至少无参 `tailcat serve` 才带 —— 用户得记住第二个名字。
+
+**现在的默认**：只要服务列表里有 `exit-node`，就**自动带上 `files`**（2026-09-17 起）。
+配套：`--files` 留空 = 用户主目录、可写（udp.18 起）。
+
+```bash
+tailcat serve --key=exit.key exit-node          # files 自动在（日志有 [auto: with exit-node]）
+TAILCAT_FILES=off tailcat serve --key=exit.key exit-node   # 真不要文件服务时的逃生开关
+```
+
+显式写了 `files` 的部署不受 `TAILCAT_FILES=off` 影响；没有 `exit-node` 的部署（只 `serve files`、
+`serve exec` 等）也不会被塞进文件服务。
 
 ### 3. 自动申请并向对端通告「稳定的公网端点」（默认开启）
 
@@ -210,7 +241,7 @@ tailcat --endpoint=203.0.113.4:41641 serve --key=exit.key exit-node
 官方 tailcat 的地址里没有任何「我是哪个构建」的信息，客户端只能连上去试。这份构建在
 **serve / genkey 打印的地址**里多写两个字段：
 
-- **能力位**：`UDP 转发` / `agent 网关`（App 的 codex、opencode 会话） / `固定端口+UPnP` / `转发经代理`；
+- **能力位**：`UDP 转发` / `固定端口+UPnP` / `转发经代理`；
 - **构建号**：`-ldflags` 注入的版本（`v0.6.0-udp.18` 这种）；非发行版构建写成 `dev`，免得伪版本号撑长地址。
 
 于是「官方版还是增强版」变成地址本身的事实，配套的 App（tier）据此把只有增强版才有的
@@ -222,7 +253,7 @@ tailcat serve --key=exit.key exit-node
 
 # 自己看一眼解出来的内容（官方二进制也能解析：未知字段被忽略）
 tailcat parse "tcp…"
-#   → "Caps": 15, "Build": "v0.6.0-udp.18"
+#   → "Caps": 13, "Build": "v0.6.0-udp.18"
 ```
 
 **要知道的代价**：能力位参与地址编码 ⇒ 同一个 key 在**官方版与增强版下打印的地址串不同**。
@@ -304,7 +335,8 @@ tier 仓库 `tools/tailcat/PATCHES.md` §2.10 的「交付路线决策」小节 
 
 | 版本 | 变化 |
 |---|---|
-| `v0.6.0-udp.18`（待发） | 地址带**能力标记**（第 8 节）：能力位 + 构建号，客户端据此分辨增强版/官方版；`--files` 留空改为「家目录 + 可写」；agent 网关增 hub 级 `files/root`（把 files 宿主根下发给 App） |
+| 待发（2026-09-17） | **默认项收尾**：`--listen-port` 默认固定 **41641**（`0`=随机，`TAILCAT_LISTEN_PORT` 仍可覆盖），端口被占用时回退随机并打**始终可见**的警告；端口自洽过滤改用**实际绑定端口**；**`exit-node` 隐式带 `files`**（`TAILCAT_FILES=off` 关） |
+| `v0.6.0-udp.18`（待发） | 地址带**能力标记**（第 8 节）：能力位 + 构建号，客户端据此分辨增强版/官方版；`--files` 留空改为「家目录 + 可写」 |
 | `v0.6.0-udp.13` | 新增 **`--bind-interface`（出口物理上行绑定，默认 off）**：第 7 节——`physical` 用 DNS anycast 探针逐候选验证后把出口自己的 socket（打洞 UDP + DERP TCP）绑到物理网卡，绕开同机 TUN 型代理的源端口改写 |
 | `v0.6.0-udp.12` | 地址改**单次打印**：分档验证完成前不发地址，之后恰好一条（有提示打提示版，没有就打原版形态）——替代 udp.11 的两段式（两条 token 容易拿错）；`--endpoint-hint=false` 立即打原版 |
 | `v0.6.0-udp.11` | 新增**地址端点提示**（第 6 节）：出口自动观测自身网络、按三档判定把直连候选编进地址（`--endpoint-hint=false` 关、`--endpoint=` 手动追加），客户端从首包起就有直连候选；格式向后兼容（官方客户端忽略新字段） |

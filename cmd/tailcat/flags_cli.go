@@ -11,10 +11,10 @@ package main
 
 import (
 	"context"
-	"strings"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/peterbourgon/ff/v4"
 	"tailscale.com/tailcfg"
@@ -31,9 +31,15 @@ var (
 	flagBindInterface *string
 )
 
+// defaultListenPort：出口的默认 UDP 打洞端口（2026-09-17，openspec exit-defaults）。
+// 固定端口让路由器/防火墙/代理规则能按源端口匹配、让 UPnP 映射跨重启稳定、也让
+// 「端口自洽过滤」有判据可用；拿不到时 magicsock 会自己回退随机（日志里会说明）。
+// `--listen-port=0`（或 TAILCAT_LISTEN_PORT=0）仍表示「随机」，与上游语义一致。
+const defaultListenPort = 41641
+
 // registerExitNodeFlags 由 newRootCommand 调用（App 构建里为空实现）。
 func registerExitNodeFlags(rootFS *ff.FlagSet) {
-	flagListenPort = rootFS.IntLong("listen-port", envInt("TAILCAT_LISTEN_PORT"), "pin the local UDP port the tunnel binds instead of choosing a random one. Pinning it lets a router, firewall, or local proxy match tailcat's own traffic by source port (e.g. send the punch socket direct while forwarded traffic keeps using a proxy) and keeps port mappings stable across restarts. The default can also be set with the TAILCAT_LISTEN_PORT environment variable")
+	flagListenPort = rootFS.IntLong("listen-port", envIntOr("TAILCAT_LISTEN_PORT", defaultListenPort), "local UDP port the tunnel binds. Defaults to 41641 (this fork), which lets a router, firewall, or local proxy match tailcat's own traffic by source port (e.g. send the punch socket direct while forwarded traffic keeps using a proxy) and keeps port mappings stable across restarts; 0 means a random port (upstream behavior). If the port is already taken, the server keeps running on a random port and logs which one. The default can also be set with the TAILCAT_LISTEN_PORT environment variable")
 	flagAdvertisePort = rootFS.IntLong("advertise-port", envInt("TAILCAT_ADVERTISE_PORT"), "external UDP port to advertise to peers as this node's endpoint, overriding the port discovered via UPnP/STUN. Set it when the router forwards a different external port to --listen-port. The default can also be set with the TAILCAT_ADVERTISE_PORT environment variable")
 	flagForwardProxy = rootFS.StringLong("forward-via-proxy", os.Getenv("TAILCAT_FORWARD_PROXY"), "route the traffic this exit node relays through an upstream proxy, e.g. socks5://127.0.0.1:6153 or http://127.0.0.1:6152. Keeps tailcat's own punch socket direct, which matters when the proxy is a TUN-mode client. The default can also be set with the TAILCAT_FORWARD_PROXY environment variable")
 	flagForwardUDP = rootFS.StringLong("forward-udp", os.Getenv("TAILCAT_FORWARD_UDP"), "how the UDP this exit node relays should use --forward-via-proxy: 'auto' (default) probes the proxy once (SOCKS5 UDP ASSOCIATE + a STUN probe) and uses it when it really relays datagrams; 'on' requires it and exits if it does not; 'off' never proxies UDP. Only socks5:// proxies can carry UDP, and the proxy server itself must support it (Surge does not; mihomo/sing-box/Xray do). The default can also be set with the TAILCAT_FORWARD_UDP environment variable")
@@ -126,6 +132,20 @@ func envInt(name string) int {
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 0 || n >= 65536 {
 		return 0
+	}
+	return n
+}
+
+// envIntOr 同上，但未设/无效时返回 def（用于「有默认值」的旗标，如 --listen-port）。
+// 注意：显式写 0（TAILCAT_LISTEN_PORT=0）会被当成有效值返回 0 —— 语义是「随机端口」。
+func envIntOr(name string, def int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 || n >= 65536 {
+		return def
 	}
 	return n
 }

@@ -15,7 +15,30 @@
  }
  
  // udpRelayEndpointReady determines whether the given relay [addrQuality] should
-@@ -643,6 +651,21 @@
+@@ -576,6 +584,22 @@
+ // Conn.noteRecvActivity no more than once every 10s, returning true if it
+ // was called, otherwise false.
+ func (de *endpoint) noteRecvActivity(src epAddr, now mono.Time) bool {
++	// PATCH(tier #10.3.1b): 已知 peer 但**一个可发送候选都没有**时，用收到包的源地址学习
++	// 候选（WireGuard roaming 语义）。否则握手响应无路可发
++	//（`no candidates available for endpoint` → `Failed to send handshake response`），
++	// 而客户端又不会重新 meow（meowed 状态陈旧）⇒ 隧道永久"单通"，一切自拨出口的能力失效。
++	// 只在候选集为空时学习，且与 lazy 路径同样受"收到包"这一事实约束；后续 meow/disco
++	// 一旦带来真实候选，这里的学习结果会被正常流程覆盖。
++	de.mu.Lock()
++	if len(de.endpointState) == 0 {
++		de.endpointState[src.ap] = &endpointState{lastGotPing: time.Now()}
++		de.bestAddr = addrQuality{epAddr: src}
++		de.bestAddrAt = now
++		de.trustBestAddrUntil = now.Add(5 * time.Second)
++		de.c.logf("magicsock: 为已知 peer %v 学习收到包的源地址 %v 作候选（候选集原本为空）",
++			de.publicKey.ShortString(), src)
++	}
++	de.mu.Unlock()
+ 	if de.isWireguardOnly {
+ 		de.mu.Lock()
+ 		de.bestAddr.ap = src.ap
+@@ -643,6 +667,21 @@
  		return udpAddr, netip.AddrPort{}, shouldPing
  	}
  
@@ -39,7 +62,7 @@
  	return udpAddr, de.derpAddr, false
 --- a/wgengine/magicsock/magicsock.go
 +++ b/wgengine/magicsock/magicsock.go
-@@ -428,6 +428,29 @@
+@@ -425,6 +425,29 @@
  	// This allows tests to pass when the user's machine is offline,
  	// but allows us to still test network-down behaviour when desired.
  	checkNetworkUpDuringTests bool
@@ -69,7 +92,7 @@
  }
  
  // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
-@@ -2847,6 +2870,169 @@
+@@ -2815,8 +2838,171 @@
  	c.peerMap.forEachEndpoint(func(ep *endpoint) {
  		ep.setHeartbeatDisabled(v)
  	})
@@ -127,8 +150,8 @@
 +		}
 +		delete(c.provisionalPeers, k)
 +	}
-+}
-+
+ }
+ 
 +// provisionalNodeID returns a node ID for a synthesized endpoint. It must be
 +// inheritedPathState is the path information a provisional endpoint carries —
 +// the addresses we have actually received packets from, and the address we
@@ -236,10 +259,12 @@
 +	c.logf("magicsock: provisional peer %v learned from %v (direct handshake, no network map)",
 +		pubKey.ShortString(), src)
 +	return ep, true
- }
- 
++}
++
  // SilentDisco returns true if silent disco is enabled, otherwise false.
-@@ -3167,7 +3353,11 @@
+ func (c *Conn) SilentDisco() bool {
+ 	c.mu.Lock()
+@@ -3135,7 +3321,11 @@
  			keep.Add(n.Key())
  		}
  		c.peerMap.forEachEndpoint(func(ep *endpoint) {
@@ -252,7 +277,7 @@
  				c.peerMap.deleteEndpoint(ep)
  			}
  		})
-@@ -3197,6 +3387,9 @@
+@@ -3165,6 +3355,9 @@
  		devPanicf("node with zero key")
  		return
  	}
@@ -262,7 +287,7 @@
  	ep, ok := c.peerMap.endpointForNodeID(n.ID())
  	if ok && ep.publicKey != n.Key() {
  		// The node rotated public keys. Delete the old endpoint and create
-@@ -3232,6 +3425,20 @@
+@@ -3200,6 +3393,20 @@
  		return
  	}
  
@@ -283,7 +308,7 @@
  	if ep, ok := c.peerMap.endpointForNodeKey(n.Key()); ok {
  		// At this point n.Key() should be for a key we've never seen before. If
  		// ok was true above, it was an update to an existing matching key and
-@@ -3296,6 +3503,34 @@
+@@ -3264,6 +3471,34 @@
  
  	ep.updateFromNode(n, flags.heartbeatDisabled, flags.probeUDPLifetimeOn)
  	c.peerMap.upsertEndpoint(ep, key.DiscoPublic{}, false)
@@ -318,10 +343,29 @@
  }
  
  // UpsertPeer adds or updates a single peer in c. It is the efficient
-@@ -4426,6 +4661,15 @@
+@@ -4394,6 +4629,34 @@
  	}
  	le.c.mu.Lock()
  	ep, ok := le.c.peerMap.endpointForNodeKey(pubKey)
++	// PATCH(tier #10.3.1): 已知 peer 但**一个可发送候选都没有**（无 UDP、也无 DERP）
++	// 时，直接把本次握手包的源地址登记为候选并短时信任 —— 否则握手响应发不出去
++	//（`addrForSendWireguardLocked: [unexpected] no candidates available for endpoint`
++	// → `Failed to send handshake response: no UDP or DERP addr`），而客户端又不会重新
++	// meow（它的 meowed 状态是陈旧的），隧道就永久"单通"（终端/文件等一切自拨出口的能力
++	// 都失效）。这正是 WireGuard 的 roaming 语义：收到有效包就信源地址。
++	if ok && ep != nil && le.c.acceptProvisionalInitiators.Load() {
++		now := mono.Now()
++		ep.mu.Lock()
++		if len(ep.endpointState) == 0 {
++			ep.endpointState[le.src.ap] = &endpointState{lastGotPing: time.Now()}
++			ep.bestAddr = addrQuality{epAddr: le.src}
++			ep.bestAddrAt = now
++			ep.trustBestAddrUntil = now.Add(5 * time.Second)
++			le.c.logf("magicsock: 为已知 peer %v 登记握手源地址 %v 作候选（候选集原本为空）",
++				pubKey.ShortString(), le.src)
++		}
++		ep.mu.Unlock()
++	}
 +	if !ok && le.c.acceptProvisionalInitiators.Load() {
 +		// PATCH(tier): this node has never heard of the sender (there is no
 +		// control plane to tell us about it). Synthesize an endpoint keyed by
@@ -334,3 +378,42 @@
  	le.c.mu.Unlock()
  	if !ok {
  		return
+--- a/wgengine/magicsock/magicsock_test.go
++++ b/wgengine/magicsock/magicsock_test.go
+@@ -28,6 +28,7 @@
+ 	"sync/atomic"
+ 	"syscall"
+ 	"testing"
++
+ 	"testing/synctest"
+ 	"time"
+ 	"unsafe"
+@@ -4927,5 +4928,28 @@
+ 	}
+ 	if conn.peerMap.knownPeerDiscoKey(dk1) {
+ 		t.Error("control key dk1 shoud not be in peermap")
++	}
++}
++
++// TestTierRoamingLearn 给 openspec exit-terminal 10.3.1 的修复上锁（本仓 fork 特有）：
++// 已知 peer 但候选集为空时，noteRecvActivity 必须把收到包的源地址登记为候选
++//（否则握手响应无路可发 → 隧道单通：终端/文件等一切自拨出口的能力失效）；
++// 候选非空时不得覆盖既有候选。
++func TestTierRoamingLearn(t *testing.T) {
++	c := &Conn{logf: t.Logf}
++	de := &endpoint{c: c, endpointState: map[netip.AddrPort]*endpointState{}}
++	src := epAddr{ap: netip.MustParseAddrPort("127.3.3.40:304")}
++	now := mono.Now()
++	de.noteRecvActivity(src, now)
++	if len(de.endpointState) != 1 {
++		t.Fatalf("空候选时应学习源地址：endpointState=%v", de.endpointState)
+ 	}
++	if de.bestAddr.epAddr.ap != src.ap {
++		t.Fatalf("bestAddr 应指向学到的源地址：%v", de.bestAddr)
++	}
++	other := epAddr{ap: netip.MustParseAddrPort("127.3.3.41:304")}
++	de.noteRecvActivity(other, now)
++	if len(de.endpointState) != 1 || de.bestAddr.epAddr.ap != src.ap {
++		t.Fatalf("已有候选时不应被覆盖：%v / %v", de.endpointState, de.bestAddr)
++	}
+ }

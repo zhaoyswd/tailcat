@@ -17,6 +17,7 @@ import (
 	"github.com/peterbourgon/ff/v4/ffhelp"
 	"github.com/tailscale/tailcat"
 	"tailscale.com/tstest"
+	"tailscale.com/util/set"
 )
 
 func TestClassifyTailcatAddrArg(t *testing.T) {
@@ -129,6 +130,90 @@ func TestPSKFlagDefaults(t *testing.T) {
 	}
 	if *genkeyPSK {
 		t.Error("genkey --psk=false parsed as true")
+	}
+}
+
+// 2026-09-17（openspec exit-defaults）：出口的 UDP 打洞端口默认固定 41641；
+// TAILCAT_LISTEN_PORT 可覆盖；显式 0 = 随机（上游语义）。
+func TestListenPortDefault(t *testing.T) {
+	t.Setenv("TAILCAT_LISTEN_PORT", "")
+	if _, err := parseCLI(t, "serve"); err != nil {
+		t.Fatal(err)
+	}
+	if got := *flagListenPort; got != defaultListenPort {
+		t.Errorf("--listen-port 默认值 = %d；期望 %d", got, defaultListenPort)
+	}
+
+	t.Setenv("TAILCAT_LISTEN_PORT", "45711")
+	if _, err := parseCLI(t, "serve"); err != nil {
+		t.Fatal(err)
+	}
+	if got := *flagListenPort; got != 45711 {
+		t.Errorf("TAILCAT_LISTEN_PORT=45711 未生效：%d", got)
+	}
+
+	t.Setenv("TAILCAT_LISTEN_PORT", "0")
+	if _, err := parseCLI(t, "serve"); err != nil {
+		t.Fatal(err)
+	}
+	if got := *flagListenPort; got != 0 {
+		t.Errorf("TAILCAT_LISTEN_PORT=0 应当表示随机：%d", got)
+	}
+
+	t.Setenv("TAILCAT_LISTEN_PORT", "45711")
+	if _, err := parseCLI(t, "--listen-port=0", "serve"); err != nil {
+		t.Fatal(err)
+	}
+	if got := *flagListenPort; got != 0 {
+		t.Errorf("显式 --listen-port=0 应当覆盖环境变量默认值：%d", got)
+	}
+}
+
+// 2026-09-17（openspec exit-defaults）：exit-node 隐式带 files；显式 files、非 exit-node 部署
+// 不受影响；TAILCAT_FILES=off 能关掉隐式添加，但关不掉显式声明的 files。
+func TestForkServiceDefaults(t *testing.T) {
+	mk := func(names ...string) set.Set[string] {
+		s := set.Set[string]{}
+		for _, n := range names {
+			s.Add(n)
+		}
+		return s
+	}
+	discard := func(string, ...any) {}
+
+	t.Setenv("TAILCAT_FILES", "")
+	s := mk("exit-node")
+	if !applyForkServiceDefaults(s, discard) || !s.Contains("files") {
+		t.Error("exit-node 未隐式带 files")
+	}
+	if applyForkServiceDefaults(s, discard) {
+		t.Error("已经带 files 的服务集不应再被判定为「自动添加」")
+	}
+	s2 := mk("files")
+	if applyForkServiceDefaults(s2, discard) || !s2.Contains("files") {
+		t.Error("只服务 files 的部署不应被改动")
+	}
+	if applyForkServiceDefaults(mk("exec"), discard) {
+		t.Error("exec 部署不应被塞 files")
+	}
+	// exit-node 与其他服务并列时同样隐式带 files（exec 是「每个连接跑一条命令」的服务，
+	// 与 files 不冲突，二者可并存）。
+	s5 := mk("exit-node", "exec")
+	if !applyForkServiceDefaults(s5, discard) || !s5.Contains("files") {
+		t.Error("exit-node,exec 应当同样隐式带 files")
+	}
+	if applyForkServiceDefaults(nil, discard) {
+		t.Error("空服务集不应被塞 files")
+	}
+
+	t.Setenv("TAILCAT_FILES", "off")
+	s3 := mk("exit-node")
+	if applyForkServiceDefaults(s3, discard) || s3.Contains("files") {
+		t.Error("TAILCAT_FILES=off 未关掉隐式 files")
+	}
+	s4 := mk("exit-node", "files")
+	if applyForkServiceDefaults(s4, discard) || !s4.Contains("files") {
+		t.Error("显式 files 不应受 TAILCAT_FILES=off 影响")
 	}
 }
 
