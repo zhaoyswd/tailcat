@@ -274,6 +274,24 @@ tailcat --verbose --listen-port=41641 serve --key=exit.key exit-node
 - 上游合并后会逐步从本 fork 去掉重复补丁；fork 只保留上游尚未合并的部分。
 - 构建完全来自官方源码 + 上述补丁，没有其它来源。
 
+### 依赖补丁怎么交付：**route A（已决策，2026-09-17）**
+
+除本 fork 自己的补丁外，出口还需要一份 **`tailscale.com`（magicsock）依赖补丁** —— 「零 DERP 直连」的
+服务端半边：出口要能接受并回应「netmap 里没有的 key」的 WireGuard 握手（tailcat 无控制面，出口就是靠
+这次握手认识客户端的），并在 netmap 提升时保留学到的直连地址（`v0.6.0-udp.18` 起）。
+
+**决定**：继续走 **route A** —— 补丁与脚本随仓库（`tools/modcache-patches/` +
+`tools/apply-modcache-patches.sh`），被改的源码在 module cache 里，**CI 构建前显式打补丁 + 校验**
+（`.github/workflows/binaries.yml` 的 "Apply modcache patches" 步；smoke 阶段再用 `strings` 验二进制里
+真的带着补丁 —— 漏打补丁照样编译成功、只是能力静默消失，光看构建是否绿挡不住）。**不做** route B
+（fork 一个 tailscale 仓 + `replace`）/ route C（内联进仓库），**等 route A 出问题再说**。
+触发条件、代价与将来怎么做（含「被 `replace` 的那份 go.mod 的 `go` 指令要 ≤1.24」这个坑）记在
+tier 仓库 `tools/tailcat/PATCHES.md` §2.10 的「交付路线决策」小节 —— 这里是同一决策在出口侧的落地说明。
+
+补丁的**唯一真源在 tier 仓库**（`tools/tailcat/modcache-patches/0001-magicsock-direct-bootstrap.patch`），
+本仓库 `tools/modcache-patches/` 下是副本：升级 tailscale 时先改 tier 那份、`patch --dry-run` 验两版
+锚点，再同步过来。
+
 ### 这次构建基于哪个上游
 
 `udp-binaries` 分支已经 **rebase 到上游 `main`**（`tailscale/tailcat`，2026-09-14 同步，基于 v0.6.0 之后的
