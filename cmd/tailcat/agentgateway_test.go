@@ -391,6 +391,35 @@ func TestAgentGatewayEndToEnd(t *testing.T) {
 
 // ---------- 会话目录（SFTP 沙箱路径 → 宿主绝对路径） ----------
 
+// files/root：App 只有拿到宿主根才能把项目目录（沙箱路径）与 session.directory
+// （宿主绝对路径）放到同一命名空间里比较——这条链路是「会话 cell 类型图标」的前提。
+func TestAgFilesRoot(t *testing.T) {
+	// hub.logf 借道 opencode 后端的 logger，所以测试里也要放一个（其余后端不必）
+	hub := &agHub{
+		backends:  map[string]agBackend{"opencode": newAGOC(func(string, ...any) {})},
+		filesRoot: "/Users/z",
+		clients:   map[*agClientConn]struct{}{},
+	}
+	c := agDialHub(t, hub)
+	defer c.conn.Close()
+	got := c.call(t, 1, "files/root", nil)["result"].(map[string]any)["root"]
+	if got != "/Users/z" {
+		t.Fatalf("files/root = %v, want /Users/z", got)
+	}
+
+	// 未配 files 的出口（纯出口节点）：空串，App 据此回退、不猜路径
+	hub2 := &agHub{
+		backends: map[string]agBackend{"opencode": newAGOC(func(string, ...any) {})},
+		clients:  map[*agClientConn]struct{}{},
+	}
+	c2 := agDialHub(t, hub2)
+	defer c2.conn.Close()
+	got2 := c2.call(t, 1, "files/root", nil)["result"].(map[string]any)["root"]
+	if got2 != "" {
+		t.Fatalf("未配 files 时 files/root = %v, want 空串", got2)
+	}
+}
+
 func TestResolveHostDir(t *testing.T) {
 	cases := []struct{ root, dir, want string }{
 		{"/Users/z", "/Documents/projects/tier", "/Users/z/Documents/projects/tier"},

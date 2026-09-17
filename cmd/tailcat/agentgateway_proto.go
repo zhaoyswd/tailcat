@@ -71,6 +71,11 @@ const (
 	agMTurnSteer       = "turn/steer" // opencode 后端不支持，返回 agCodeUnsupported
 	agMApprovalRespond = "approval/respond"
 	agMModelList       = "model/list"
+	// agMFilesRoot 是 **hub 级**方法（与 backend 无关）：网关自报 files 服务的宿主根。
+	// 后端返回的 session.directory 是宿主绝对路径，而 App 手里的项目目录是 files 服务的
+	// SFTP 沙箱路径（os.Root 故意隐藏根位置）——换算关系只有网关知道，所以把根暴露出去，
+	// App 自己拼即可落在同一命名空间里做精确匹配（不再靠后缀/尾段猜）。
+	agMFilesRoot = "files/root"
 )
 
 const (

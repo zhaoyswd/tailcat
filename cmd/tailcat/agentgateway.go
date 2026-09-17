@@ -56,8 +56,9 @@ func startAgentGateway(logf logger.Logf, filesRoot string) {
 	cx := newAGCodex(logf)
 	cx.filesRoot = filesRoot
 	hub := &agHub{
-		backends: map[string]agBackend{"opencode": oc, "codex": cx},
-		clients:  map[*agClientConn]struct{}{},
+		backends:  map[string]agBackend{"opencode": oc, "codex": cx},
+		filesRoot: filesRoot,
+		clients:   map[*agClientConn]struct{}{},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -105,8 +106,11 @@ type agClientConn struct {
 
 type agHub struct {
 	backends map[string]agBackend
-	mu       sync.Mutex
-	clients  map[*agClientConn]struct{}
+	// filesRoot：serve --files 的宿主目录（与 resolveHostDir 同一个值）。空 = 未配 files
+	// （此时 App 拿不到宿主根，只能退回沙箱路径比较）。经 `files/root` 下发给 App。
+	filesRoot string
+	mu        sync.Mutex
+	clients   map[*agClientConn]struct{}
 }
 
 func (h *agHub) count() int {
@@ -270,6 +274,13 @@ func (cl *agClientConn) handle(req *agRequest) (any, *agRPCError) {
 			"capabilities": b.caps(),
 			"serverInfo":   map[string]any{"name": "tailcat-agent-gateway", "version": "1.0", "backend": b.caps().Backend},
 		}, nil
+
+	case agMFilesRoot:
+		// hub 级（与 backend 无关，也不要求 initialize 先跑）：files 服务的宿主根。
+		// App 用它把「项目目录（SFTP 沙箱路径）」拼成宿主绝对路径，与
+		// session.directory（后端返回的宿主绝对路径）落在同一命名空间里做精确匹配。
+		// 未配 files 时为空串，App 侧据此回退（不猜）。
+		return map[string]any{"root": cl.hub.filesRoot}, nil
 
 	case agMSessionList:
 		sessions, err := b.listSessions(ctx)
