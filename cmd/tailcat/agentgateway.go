@@ -16,15 +16,26 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"tailscale.com/types/logger"
 )
 
-// filesRoot：serve 的 --files 目录（同一进程内拿到，用于把 App 传来的 SFTP 沙箱路径
-// 换算成宿主真实绝对路径——files 服务基于 os.Root，故意不暴露根位置，opencode 又只认
-// 绝对路径，所以换算只能在这里做）。空 = 未配 files，路径原样透传。
+// resolveHostDir 把 App 传来的 files 服务 SFTP 沙箱路径换算成宿主真实绝对路径
+// ——files 服务基于 os.Root，故意不暴露根位置，后端（opencode/codex）要的都是宿主
+// 绝对路径，所以换算只能在这里做。空目录（未选项目）或未配 filesRoot（路径本就当
+// 绝对路径用）时原样返回。
+func resolveHostDir(filesRoot, directory string) string {
+	if directory == "" || filesRoot == "" {
+		return directory
+	}
+	return filepath.Join(filesRoot, filepath.Clean(directory))
+}
+
+// filesRoot：serve 的 --files 目录（同一进程内拿到，见 resolveHostDir）。
+// 空 = 未配 files，路径原样透传。
 func startAgentGateway(logf logger.Logf, filesRoot string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -43,6 +54,7 @@ func startAgentGateway(logf logger.Logf, filesRoot string) {
 	oc := newAGOC(logger.WithPrefix(logf, "[opencode] "))
 	oc.filesRoot = filesRoot
 	cx := newAGCodex(logf)
+	cx.filesRoot = filesRoot
 	hub := &agHub{
 		backends: map[string]agBackend{"opencode": oc, "codex": cx},
 		clients:  map[*agClientConn]struct{}{},

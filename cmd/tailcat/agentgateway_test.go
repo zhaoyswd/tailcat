@@ -14,6 +14,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -384,6 +386,79 @@ func TestAgentGatewayEndToEnd(t *testing.T) {
 	n2 := c2.waitNotice(t, agNSessionUpdated, 3*time.Second)
 	if n2["params"].(map[string]any)["session"].(map[string]any)["status"] != "idle" {
 		t.Fatalf("c2 idle: %v", n2)
+	}
+}
+
+// ---------- 会话目录（SFTP 沙箱路径 → 宿主绝对路径） ----------
+
+func TestResolveHostDir(t *testing.T) {
+	cases := []struct{ root, dir, want string }{
+		{"/Users/z", "/Documents/projects/tier", "/Users/z/Documents/projects/tier"},
+		{"/srv/root", "/Documents/x/", "/srv/root/Documents/x"},
+		{"/srv/root", "/a/../b", "/srv/root/b"},
+		{"", "/Documents/x", "/Documents/x"}, // 未配 files：当绝对路径原样用
+		{"/srv/root", "", ""},                // 未选项目
+	}
+	for _, c := range cases {
+		if got := resolveHostDir(c.root, c.dir); got != c.want {
+			t.Errorf("resolveHostDir(%q, %q) = %q, want %q", c.root, c.dir, got, c.want)
+		}
+	}
+}
+
+// 假 codex app-server：只认 initialize 与 thread/start（后者把收到的 cwd 回显成
+// thread.cwd）。真 codex 的 schema 与行为另有实测证据（见 agentgateway_codex.go
+// createSession 注释），这里钉的是「网关有没有把换算后的宿主绝对路径传下去」。
+const fakeCodexScript = `#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    m = json.loads(line)
+    if m.get("method") == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": {"userAgent": "fake"}}), flush=True)
+    elif m.get("method") == "thread/start":
+        cwd = (m.get("params") or {}).get("cwd", "")
+        print(json.dumps({"jsonrpc": "2.0", "id": m["id"],
+                          "result": {"thread": {"id": "t1", "cwd": cwd, "createdAt": 1, "updatedAt": 2}}}), flush=True)
+`
+
+func TestAgCodexCreateSessionSendsHostCwd(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "codex"), []byte(fakeCodexScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 假 codex 放在 PATH 最前（LookPath 取第一个命中）；保留原 PATH 是为了让
+	// 脚本的 `#!/usr/bin/env python3` 还能找到解释器。
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	b := newAGCodex(func(string, ...any) {})
+	b.filesRoot = "/Users/z"
+	t.Cleanup(func() {
+		b.mu.Lock()
+		cmd := b.cmd
+		b.mu.Unlock()
+		if cmd != nil && cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	})
+
+	s, err := b.createSession(context.Background(), "tier", "/Documents/projects/tier")
+	if err != nil {
+		t.Fatalf("createSession: %v", err)
+	}
+	if s.Directory != "/Users/z/Documents/projects/tier" {
+		t.Fatalf("cwd = %q, want 宿主绝对路径", s.Directory)
+	}
+
+	// 未选项目（directory 空）时不传 cwd：会话继承 app-server 自己的目录
+	s2, err := b.createSession(context.Background(), "", "")
+	if err != nil {
+		t.Fatalf("createSession(空目录): %v", err)
+	}
+	if s2.Directory != "" {
+		t.Fatalf("空目录不该带 cwd，cwd = %q", s2.Directory)
 	}
 }
 

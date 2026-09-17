@@ -123,6 +123,8 @@ type agCodex struct {
 	logf logger.Logf
 	out  chan agNtfOut
 
+	filesRoot string // serve --files 的宿主目录；App 传 SFTP 沙箱路径时换算（见 resolveHostDir）
+
 	mu       sync.Mutex
 	cmd      *exec.Cmd
 	stdin    io.WriteCloser
@@ -442,10 +444,15 @@ func (b *agCodex) createSession(ctx context.Context, title, directory string) (*
 	if err := b.ensureBackend(ctx); err != nil {
 		return nil, err
 	}
-	// TODO(codex-目录)：thread/start 是否收 cwd 待确认；先忽略 directory（会话落在默认目录），
-	// UI 侧已统一带目录创建，codex 后端补上后无需改 App。
-	_ = directory
-	resp, err := b.call(ctx, "thread/start", map[string]any{})
+	// 会话目录：thread/start 收 `cwd`（0.154 的 app-server schema 里是正式参数，实测生效），
+	// 不传就继承 app-server 自己的 cwd（= $HOME）——那样会话的工作区根是家目录、
+	// thread.cwd 也只报家目录（App 会话页副标题就显示 $HOME，且会话 cell 的类型图标
+	// 匹配不上项目 absPath）。参数不存在的路径也不报错，所以直接传，不做 stat 兜底。
+	params := map[string]any{}
+	if d := resolveHostDir(b.filesRoot, directory); d != "" {
+		params["cwd"] = d
+	}
+	resp, err := b.call(ctx, "thread/start", params)
 	if err != nil {
 		return nil, err
 	}

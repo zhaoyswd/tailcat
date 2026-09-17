@@ -26,7 +26,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -394,12 +393,10 @@ func (b *agOC) createSession(ctx context.Context, title, directory string) (*agS
 	// directory 字段会被静默忽略、回落实例 cwd——2026-09-16 本机实测；之前记录的
 	// 「body 生效」是假阳性：测试实例的 cwd 恰好同路径）。
 	// App 传的是 files 服务的 SFTP 沙箱路径（/x/y）：filesRoot 已配则换算成宿主绝对路径
-	//（os.Root 不暴露根位置，只有同进程的我们知道）；否则视为已是绝对路径原样传。
+	//（见 resolveHostDir）；否则视为已是绝对路径原样传。
 	pathSuffix := ""
 	if directory != "" {
-		if b.filesRoot != "" {
-			directory = filepath.Join(b.filesRoot, filepath.Clean(directory))
-		}
+		directory = resolveHostDir(b.filesRoot, directory)
 		pathSuffix = "?directory=" + url.QueryEscape(directory)
 	}
 	var oc ocpSession
