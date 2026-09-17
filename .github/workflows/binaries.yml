@@ -56,6 +56,9 @@ jobs:
       - name: Apply modcache patches (tailscale.com)
         run: |
           set -eu
+          # 先把依赖真正拉下来：setup-go 之后 module cache 里还没有解压好的 tailscale.com，
+          # 而补丁是打在**解压后的源码副本**上的（第一次跑就踩了这个：脚本报"cache 里没有该版本"）。
+          go mod download tailscale.com
           ./tools/apply-modcache-patches.sh
           MOD="$(go env GOMODCACHE)/tailscale.com@$(sed -n 's/^[[:space:]]*tailscale\.com \(v[^[:space:]]*\).*/\1/p' go.mod | head -1)"
           grep -q 'PATCH(tier)' "$MOD/wgengine/magicsock/endpoint.go"
