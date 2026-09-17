@@ -123,8 +123,8 @@ jobs:
           # 原子应用，验到其中一处即可证明整份补丁到位。
           strings dist/tailcat | grep -q 'provisional peer' \
             || { echo "error: 二进制里没有 magicsock 直连引导补丁" >&2; exit 1; }
-          strings dist/tailcat | grep -q 'promoted to network map' \
-            || { echo "error: 二进制里缺少临时 peer 提升逻辑" >&2; exit 1; }
+          strings dist/tailcat | grep -q 'adopted by the network map' \
+            || { echo "error: 二进制里缺少临时 peer 就地收养逻辑" >&2; exit 1; }
           echo "modcache patch present in dist/tailcat"
   release:
     if: startsWith(github.ref, 'refs/tags/')

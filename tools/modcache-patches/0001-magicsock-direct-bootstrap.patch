@@ -15,33 +15,86 @@
  }
  
  // udpRelayEndpointReady determines whether the given relay [addrQuality] should
-@@ -576,6 +584,22 @@
+@@ -572,10 +580,73 @@
+ 	de.fakeWGAddr = netip.AddrPortFrom(netip.AddrFrom16(addr).Unmap(), 12345)
+ }
+ 
++// tierLearnedEndpointMax caps the number of direct candidates learned from
++// received packets (see noteDirectCandidate), so a peer that sprays packets
++// from many source ports cannot grow the candidate set without bound. Entries
++// age out on their own (sessionActiveTimeout), so this is a ceiling, not a
++// quota.
++const tierLearnedEndpointMax = 16
++
++// PATCH(tier #10.3.1b): noteDirectCandidate records src.ap as a live direct
++// path for de — the WireGuard roaming rule ("a packet we just received provably
++// came from the address we received it from"). An unknown address is added as a
++// candidate, a known one has its lastGotPing refreshed so the network map
++// cleanup (sessionActiveTimeout) does not delete a path we are actively
++// receiving from.
++//
++// Addresses that came from the network map (lastGotPing zero) are left to the
++// index bookkeeping in [endpoint.setEndpointsLocked]; they must not acquire the
++// runtime-discovered semantics, or they would be deleted 45s after the peer
++// goes quiet even though they are still in the network map.
++//
++// When the candidate set was empty this also reinstates src.ap as the best
++// address with a short trust window: that is the recovery path from the wedged
++// state (no sendable candidate ⇒ handshake responses dropped ⇒ no traffic that
++// could refresh anything), and it makes the first response leave over the path
++// the request actually came in on.
++func (de *endpoint) noteDirectCandidate(src epAddr, now mono.Time) {
++	if !src.isDirect() {
++		// DERP（tailcfg.DerpMagicIPAddr）或 peer-relay（vni）来的包不带直连路径
++		// 信息：把这种伪地址写进候选 / best 会把出站流量送去一个不存在的路径。
++		return
++	}
++	de.mu.Lock()
++	defer de.mu.Unlock()
++	if st, ok := de.endpointState[src.ap]; ok {
++		if !st.lastGotPing.IsZero() {
++			st.lastGotPing = time.Now()
++		}
++	} else if len(de.endpointState) >= tierLearnedEndpointMax {
++		return
++	} else {
++		de.endpointState[src.ap] = &endpointState{lastGotPing: time.Now()}
++		de.c.logf("magicsock: 为 peer %v 登记收到包的源地址 %v 作直连候选（候选数 %d）",
++			de.publicKey.ShortString(), src.ap, len(de.endpointState))
++	}
++	// 收到包的地址就是「响应该回去的地方」：无条件把 best 换成它（短信任窗，与
++	// wireguard-only peer 的既有漫游语义一致）。这不是可选项 —— 出口上一代会话的
++	// best 可能还在信任窗内（换网/重连后它已是个死地址），此时若不动 best，握手
++	// 响应会发给旧地址，客户端要等信任窗过期后的重试才连得上（真机实测 5s 起步，
++	// 更糟的情况是永远连不上）。
++	de.setBestAddrLocked(addrQuality{epAddr: src})
++	de.bestAddrAt = now
++	de.trustBestAddrUntil = now.Add(5 * time.Second)
++}
++
+ // noteRecvActivity records receive activity on de, and invokes
  // Conn.noteRecvActivity no more than once every 10s, returning true if it
  // was called, otherwise false.
  func (de *endpoint) noteRecvActivity(src epAddr, now mono.Time) bool {
-+	// PATCH(tier #10.3.1b): 已知 peer 但**一个可发送候选都没有**时，用收到包的源地址学习
-+	// 候选（WireGuard roaming 语义）。否则握手响应无路可发
-+	//（`no candidates available for endpoint` → `Failed to send handshake response`），
-+	// 而客户端又不会重新 meow（meowed 状态陈旧）⇒ 隧道永久"单通"，一切自拨出口的能力失效。
-+	// 只在候选集为空时学习，且与 lazy 路径同样受"收到包"这一事实约束；后续 meow/disco
-+	// 一旦带来真实候选，这里的学习结果会被正常流程覆盖。
-+	de.mu.Lock()
-+	if len(de.endpointState) == 0 {
-+		de.endpointState[src.ap] = &endpointState{lastGotPing: time.Now()}
-+		de.bestAddr = addrQuality{epAddr: src}
-+		de.bestAddrAt = now
-+		de.trustBestAddrUntil = now.Add(5 * time.Second)
-+		de.c.logf("magicsock: 为已知 peer %v 学习收到包的源地址 %v 作候选（候选集原本为空）",
-+			de.publicKey.ShortString(), src)
++	// PATCH(tier #10.3.1b): 「收到某地址发来的有效 WireGuard 包」是没有控制面时
++	// 该直连路径可达的唯一证据，把它登记/刷新为候选（WireGuard roaming 语义）。
++	// 不这么做的话：出口的候选集里只剩旧地址（甚至因为会话超时被清空）时，
++	// 握手响应发不出去（`no candidates available for endpoint` →
++	// `Failed to send handshake response: no UDP or DERP addr`），而客户端不会重新
++	// meow（它的 meowed 状态是陈旧的）⇒ 隧道永久"单通"，一切自拨出口的能力（文件、
++	// 终端…）都失效。
++	if de.c.acceptProvisionalInitiators.Load() {
++		de.noteDirectCandidate(src, now)
 +	}
-+	de.mu.Unlock()
  	if de.isWireguardOnly {
  		de.mu.Lock()
  		de.bestAddr.ap = src.ap
-@@ -643,6 +667,21 @@
+@@ -641,6 +712,21 @@
+ 		// address to send to, so we have to send to the UDP address.
+ 		udpAddr, shouldPing := de.addrForWireGuardSendLocked(now)
  		return udpAddr, netip.AddrPort{}, shouldPing
- 	}
- 
++	}
++
 +	// PATCH(tier): bootstrap candidates. We have no trusted bestAddr, so
 +	// normally there is nothing to send to but DERP. If the caller asked for
 +	// bootstrap sends ([Conn.SetBootstrapCandidates]) and we do have candidate
@@ -55,11 +108,9 @@
 +		if candidate, _ := de.addrForWireGuardSendLocked(now); candidate.ap.IsValid() {
 +			udpAddr = candidate
 +		}
-+	}
-+
+ 	}
+ 
  	// We had a bestAddr but it expired so send both to it
- 	// and DERP.
- 	return udpAddr, de.derpAddr, false
 --- a/wgengine/magicsock/magicsock.go
 +++ b/wgengine/magicsock/magicsock.go
 @@ -425,6 +425,29 @@
@@ -92,12 +143,10 @@
  }
  
  // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
-@@ -2815,8 +2838,171 @@
- 	c.peerMap.forEachEndpoint(func(ep *endpoint) {
- 		ep.setHeartbeatDisabled(v)
+@@ -2817,6 +2840,184 @@
  	})
-+}
-+
+ }
+ 
 +// PATCH(tier): bounds for endpoints synthesized from inbound handshakes.
 +const (
 +	// provisionalEndpointMax caps how many unknown-key endpoints we hold at
@@ -150,30 +199,6 @@
 +		}
 +		delete(c.provisionalPeers, k)
 +	}
- }
- 
-+// provisionalNodeID returns a node ID for a synthesized endpoint. It must be
-+// inheritedPathState is the path information a provisional endpoint carries —
-+// the addresses we have actually received packets from, and the address we
-+// were last able to reach — captured before the endpoint is replaced by the
-+// network map version of the same peer.
-+type inheritedPathState struct {
-+	addrs []netip.AddrPort
-+	best  addrQuality
-+}
-+
-+// takeProvisionalPathState snapshots ep's learned path. The endpoint must be
-+// withdrawn from the peer map by the caller immediately after (the snapshot is
-+// what survives).
-+func takeProvisionalPathState(ep *endpoint) *inheritedPathState {
-+	st := &inheritedPathState{}
-+	ep.mu.Lock()
-+	for ap := range ep.endpointState {
-+		st.addrs = append(st.addrs, ap)
-+	}
-+	st.best = ep.bestAddr
-+	ep.mu.Unlock()
-+	return st
 +}
 +
 +// provisionalNodeID returns a node ID for a synthesized endpoint. It must be
@@ -261,10 +286,49 @@
 +	return ep, true
 +}
 +
++// adoptProvisionalEndpointLocked turns a provisional endpoint (synthesized
++// from a direct handshake, see upsertProvisionalEndpointLocked) into the
++// network map's version of that peer, **in place**.
++//
++// Why in place: the WireGuard device pins the endpoint object it was given when
++// the peer was created (lazily, via [Conn.ParseEndpoint]) and never roams to a
++// different object. Replacing the object (delete + create) therefore leaves
++// the device sending handshake responses and data through an orphaned endpoint
++// that can no longer learn anything: with no control plane the *received*
++// packets are the only source of path knowledge, and after the swap those go to
++// the new object. The orphaned one keeps its stale candidate list — or, once
++// the session expires, none at all — and the tunnel stays up while every
++// self-dialed connection through it dies.
++//
++// The network map is still authoritative for everything it carries (node ID,
++// disco key, DERP home, endpoints, WireGuard-only-ness): the caller runs the
++// ordinary update path on the same object right after.
++//
++// c.mu must be held.
++func (c *Conn) adoptProvisionalEndpointLocked(ep *endpoint, n tailcfg.NodeView) {
++	oldID := ep.nodeID
++	ep.nodeID = n.ID()
++	ep.provisional = false
++	ep.isWireguardOnly = n.IsWireGuardOnly()
++	delete(c.provisionalPeers, ep.publicKey)
++	if n.Addresses().Len() > 0 {
++		ep.nodeAddr = n.Addresses().At(0).Addr()
++	}
++	// The TSMP marker was a provisional-phase placeholder ("no control disco
++	// key known yet"). The network map brings the peer's real disco key, so
++	// drop it: [endpoint.updateDiscoKey] keeps a set tsmpActive flag sticky,
++	// and a peer with an active TSMP key would have disco sent to the empty
++	// TSMP key instead of the peer's real one.
++	ep.disco.Store(&endpointDisco{})
++	c.peerMap.rekeyEndpointLocked(ep, oldID)
++	c.logf("magicsock: provisional peer %v adopted by the network map in place (nodeID %v→%v, wgonly=%v, candidates=%d)",
++		ep.publicKey.ShortString(), oldID, ep.nodeID, ep.isWireguardOnly, len(ep.endpointState))
++}
++
  // SilentDisco returns true if silent disco is enabled, otherwise false.
  func (c *Conn) SilentDisco() bool {
  	c.mu.Lock()
-@@ -3135,7 +3321,11 @@
+@@ -3135,7 +3336,11 @@
  			keep.Add(n.Key())
  		}
  		c.peerMap.forEachEndpoint(func(ep *endpoint) {
@@ -277,95 +341,29 @@
  				c.peerMap.deleteEndpoint(ep)
  			}
  		})
-@@ -3165,6 +3355,9 @@
- 		devPanicf("node with zero key")
- 		return
+@@ -3172,6 +3377,18 @@
+ 		c.peerMap.deleteEndpoint(ep)
+ 		ok = false
  	}
-+	// PATCH(tier): path state inherited from a provisional endpoint that this
-+	// network map promotes into a real peer (see below).
-+	var inherited *inheritedPathState
- 	ep, ok := c.peerMap.endpointForNodeID(n.ID())
- 	if ok && ep.publicKey != n.Key() {
- 		// The node rotated public keys. Delete the old endpoint and create
-@@ -3200,6 +3393,20 @@
- 		return
- 	}
- 
-+	if ep, ok := c.peerMap.endpointForNodeKey(n.Key()); ok {
-+		// PATCH(tier): an endpoint synthesized from a direct handshake has a
-+		// synthetic node ID and no control-learned disco key, so it cannot be
-+		// updated in place ([endpoint.updateFromNode] dereferences its control
-+		// disco key, which does not exist). The network map is authoritative:
-+		// drop it and create the real endpoint below, but carry over the path
-+		// state we learned from the handshake (the sender's address, which is
-+		// the only direct path we know) instead of throwing it away.
-+		if ep.provisional {
-+			inherited = takeProvisionalPathState(ep)
-+			c.peerMap.deleteEndpoint(ep)
-+			delete(c.provisionalPeers, ep.publicKey)
++	if !ok {
++		// PATCH(tier): the network map is the authoritative version of a peer
++		// we already learned from a direct handshake. Adopt that endpoint in
++		// place rather than deleting and recreating it — the WireGuard device
++		// holds the object (see adoptProvisionalEndpointLocked) and a
++		// replacement would orphan it, permanently breaking every handshake
++		// response for this peer.
++		if pep, pok := c.peerMap.endpointForNodeKey(n.Key()); pok && pep.provisional {
++			c.adoptProvisionalEndpointLocked(pep, n)
++			ep, ok = pep, true
 +		}
 +	}
- 	if ep, ok := c.peerMap.endpointForNodeKey(n.Key()); ok {
- 		// At this point n.Key() should be for a key we've never seen before. If
- 		// ok was true above, it was an update to an existing matching key and
-@@ -3264,6 +3471,34 @@
- 
- 	ep.updateFromNode(n, flags.heartbeatDisabled, flags.probeUDPLifetimeOn)
- 	c.peerMap.upsertEndpoint(ep, key.DiscoPublic{}, false)
-+
-+	// PATCH(tier): re-apply the direct path learned from a provisional
-+	// endpoint, so that this peer can still be reached over UDP at the address
-+	// its handshake came from (the network map carries no endpoints for it).
-+	// DERP is available too now that the node is in the network map, so this
-+	// only adds a preferred path; it does not remove the fallback.
-+	if inherited != nil {
-+		ep.mu.Lock()
-+		now := mono.Now()
-+		for _, ap := range inherited.addrs {
-+			if _, ok := ep.endpointState[ap]; !ok {
-+				ep.endpointState[ap] = &endpointState{lastGotPing: time.Now()}
-+			}
-+		}
-+		if inherited.best.ap.IsValid() {
-+			ep.setBestAddrLocked(inherited.best)
-+			ep.bestAddrAt = now
-+			ep.trustBestAddrUntil = now.Add(trustUDPAddrDuration)
-+		}
-+		ep.mu.Unlock()
-+		// Teach the peer map which addresses belong to this peer, so inbound
-+		// packets from them resolve directly instead of via a lazyEndpoint.
-+		for _, ap := range inherited.addrs {
-+			c.peerMap.setNodeKeyForEpAddr(epAddr{ap: ap}, ep.publicKey)
-+		}
-+		c.logf("magicsock: provisional peer %v promoted to network map; kept direct path %v",
-+			ep.publicKey.ShortString(), inherited.addrs)
-+	}
- }
- 
- // UpsertPeer adds or updates a single peer in c. It is the efficient
-@@ -4394,6 +4629,34 @@
+ 	if ok {
+ 		// At this point we're modifying an existing endpoint (ep) whose
+ 		// public key and nodeID match n. Its other fields (such as disco
+@@ -4394,6 +4611,15 @@
  	}
  	le.c.mu.Lock()
  	ep, ok := le.c.peerMap.endpointForNodeKey(pubKey)
-+	// PATCH(tier #10.3.1): 已知 peer 但**一个可发送候选都没有**（无 UDP、也无 DERP）
-+	// 时，直接把本次握手包的源地址登记为候选并短时信任 —— 否则握手响应发不出去
-+	//（`addrForSendWireguardLocked: [unexpected] no candidates available for endpoint`
-+	// → `Failed to send handshake response: no UDP or DERP addr`），而客户端又不会重新
-+	// meow（它的 meowed 状态是陈旧的），隧道就永久"单通"（终端/文件等一切自拨出口的能力
-+	// 都失效）。这正是 WireGuard 的 roaming 语义：收到有效包就信源地址。
-+	if ok && ep != nil && le.c.acceptProvisionalInitiators.Load() {
-+		now := mono.Now()
-+		ep.mu.Lock()
-+		if len(ep.endpointState) == 0 {
-+			ep.endpointState[le.src.ap] = &endpointState{lastGotPing: time.Now()}
-+			ep.bestAddr = addrQuality{epAddr: le.src}
-+			ep.bestAddrAt = now
-+			ep.trustBestAddrUntil = now.Add(5 * time.Second)
-+			le.c.logf("magicsock: 为已知 peer %v 登记握手源地址 %v 作候选（候选集原本为空）",
-+				pubKey.ShortString(), le.src)
-+		}
-+		ep.mu.Unlock()
-+	}
 +	if !ok && le.c.acceptProvisionalInitiators.Load() {
 +		// PATCH(tier): this node has never heard of the sender (there is no
 +		// control plane to tell us about it). Synthesize an endpoint keyed by
@@ -388,32 +386,107 @@
  	"testing/synctest"
  	"time"
  	"unsafe"
-@@ -4927,5 +4928,28 @@
+@@ -4927,5 +4928,80 @@
  	}
  	if conn.peerMap.knownPeerDiscoKey(dk1) {
  		t.Error("control key dk1 shoud not be in peermap")
 +	}
 +}
 +
-+// TestTierRoamingLearn 给 openspec exit-terminal 10.3.1 的修复上锁（本仓 fork 特有）：
-+// 已知 peer 但候选集为空时，noteRecvActivity 必须把收到包的源地址登记为候选
-+//（否则握手响应无路可发 → 隧道单通：终端/文件等一切自拨出口的能力失效）；
-+// 候选非空时不得覆盖既有候选。
++// TestTierRoamingLearn 给「收到包即学习/漫游」上锁（本仓 fork 特有，doc: tools/tailcat/PATCHES.md §2.10）：
++// 出口（SetAcceptProvisionalInitiators 打开）从某个地址收到有效 WG 包，就必须把该地址登记为
++// 直连候选，并把 best 无条件指向它 —— 无论候选集是否为空、旧 best 是否还在信任窗内。
++// 没有控制面时「收到包」是直连路径可达的唯一证据：不学，出口就会在旧候选过期后发不出握手
++// 响应（no candidates available → Failed to send handshake response），隧道"通了"但一切
++// 自拨出口的能力（文件/终端）都失效。
 +func TestTierRoamingLearn(t *testing.T) {
 +	c := &Conn{logf: t.Logf}
++	c.acceptProvisionalInitiators.Store(true)
 +	de := &endpoint{c: c, endpointState: map[netip.AddrPort]*endpointState{}}
-+	src := epAddr{ap: netip.MustParseAddrPort("127.3.3.40:304")}
 +	now := mono.Now()
++	src := epAddr{ap: netip.MustParseAddrPort("192.0.2.5:304")}
++	if !src.isDirect() {
++		t.Fatal("前置：测试地址应为直连地址")
++	}
 +	de.noteRecvActivity(src, now)
-+	if len(de.endpointState) != 1 {
-+		t.Fatalf("空候选时应学习源地址：endpointState=%v", de.endpointState)
- 	}
-+	if de.bestAddr.epAddr.ap != src.ap {
-+		t.Fatalf("bestAddr 应指向学到的源地址：%v", de.bestAddr)
-+	}
-+	other := epAddr{ap: netip.MustParseAddrPort("127.3.3.41:304")}
-+	de.noteRecvActivity(other, now)
 +	if len(de.endpointState) != 1 || de.bestAddr.epAddr.ap != src.ap {
-+		t.Fatalf("已有候选时不应被覆盖：%v / %v", de.endpointState, de.bestAddr)
++		t.Fatalf("空候选时应学习源地址并设为 best：%v / %v", de.endpointState, de.bestAddr)
 +	}
++
++	// 已登记的运行时条目：刷新 lastGotPing（netmap 清理按它判活，不刷新会被误删）
++	old := time.Now().Add(-time.Hour)
++	de.endpointState[src.ap].lastGotPing = old
++	de.noteRecvActivity(src, now)
++	if !de.endpointState[src.ap].lastGotPing.After(old) {
++		t.Fatal("已登记地址应刷新 lastGotPing")
++	}
++
++	// 新地址（换网/漫游）：best 必须无条件跟随，哪怕旧 best 还在信任窗内 ——
++	// 否则握手响应会发给死地址，客户端要等信任窗过期重试才连得上（真机 5s 起步）
++	other := epAddr{ap: netip.MustParseAddrPort("192.0.2.6:304")}
++	de.noteRecvActivity(other, now)
++	if de.bestAddr.epAddr.ap != other.ap {
++		t.Fatalf("best 应无条件跟随最近收到包的地址：%v", de.bestAddr)
++	}
++
++	// netmap 来的条目（lastGotPing 为零）保持为零：它归 netmap 的 index 管理，
++	// 不能获得运行时语义（否则 peer 安静 45s 就被 sessionActiveTimeout 删掉，尽管还在 netmap 里）
++	nmap := epAddr{ap: netip.MustParseAddrPort("192.0.2.7:304")}
++	de.endpointState[nmap.ap] = &endpointState{}
++	de.noteRecvActivity(nmap, now)
++	if !de.endpointState[nmap.ap].lastGotPing.IsZero() {
++		t.Fatal("netmap 来的条目不得获得运行时 lastGotPing")
++	}
++
++	// 非直连源（DERP 伪地址 / 带 VNI 的中继地址）不登记：写进去会把出站流量送去死路径
++	derp := epAddr{ap: netip.MustParseAddrPort("127.3.3.40:304")}
++	if derp.isDirect() {
++		t.Fatal("前置：DERP 伪地址不应被判为直连")
++	}
++	de.noteRecvActivity(derp, now)
++	if _, ok := de.endpointState[derp.ap]; ok {
++		t.Fatal("DERP 地址不得登记为直连候选")
++	}
++
++	// 未开启 AcceptProvisionalInitiators（普通客户端/其它 tailscale.com 使用者）时完全不动
++	plain := &Conn{logf: t.Logf}
++	plainEP := &endpoint{c: plain, endpointState: map[netip.AddrPort]*endpointState{}}
++	plainEP.noteRecvActivity(src, now)
++	if len(plainEP.endpointState) != 0 || plainEP.bestAddr.ap.IsValid() {
++		t.Fatalf("未开启时不应学习：%v / %v", plainEP.endpointState, plainEP.bestAddr)
++	}
++
++	// 上限：学到的候选不得超过 tierLearnedEndpointMax（防端口喷洒把候选表撑爆）
++	base := netip.MustParseAddr("192.0.2.10")
++	for i := 0; i < tierLearnedEndpointMax; i++ {
++		de.noteRecvActivity(epAddr{ap: netip.AddrPortFrom(base, uint16(1000+i))}, now)
++	}
++	capped := epAddr{ap: netip.AddrPortFrom(base, 9999)}
++	de.noteRecvActivity(capped, now)
++	if _, ok := de.endpointState[capped.ap]; ok {
++		t.Fatalf("达到上限 %d 后不得再登记新候选", tierLearnedEndpointMax)
+ 	}
  }
+--- a/wgengine/magicsock/peermap.go
++++ b/wgengine/magicsock/peermap.go
+@@ -228,6 +228,20 @@
+ 	}
+ }
+ 
++// rekeyEndpointLocked moves ep in the byNodeID index from oldID to ep.nodeID.
++// It is used when an endpoint adopted from a provisional peer (see
++// [Conn.adoptProvisionalEndpointLocked]) trades its synthetic node ID for the
++// network map's real one; the two IDs must never both resolve to the same peer,
++// or [Conn.upsertPeerLocked] would see a stale endpoint for the old ID.
++func (m *peerMap) rekeyEndpointLocked(ep *endpoint, oldID tailcfg.NodeID) {
++	if pi, ok := m.byNodeKey[ep.publicKey]; ok {
++		m.byNodeID[ep.nodeID] = pi
++	}
++	if was, ok := m.byNodeID[oldID]; ok && was.ep == ep {
++		delete(m.byNodeID, oldID)
++	}
++}
++
+ // deleteEndpoint deletes the peerInfo associated with ep, and
+ // updates indexes.
+ func (m *peerMap) deleteEndpoint(ep *endpoint) {
