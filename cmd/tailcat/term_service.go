@@ -338,6 +338,10 @@ type termSession struct {
 	agent      byte
 	state      byte
 	prevCPU    int64
+	prevQuiet  int // 截至上一采样的连续安静拍数（classifyAgent 磁滞输入）
+	// outBuckets：按绝对秒键的输出字节桶（定长环形，countOutLocked 写、
+	// outBytesLocked 求窗口和）——输出腿的数据源，见 term_agent.go 阈值注释。
+	outBuckets [4]outBucket
 	lastOut    time.Time
 	lastActive time.Time
 	cols, rows uint16
@@ -346,6 +350,43 @@ type termSession struct {
 	killed     bool // App 主动 KILL（ENDED 的 code 用 termEndKilled 而不是信号退出码）
 	exitCode   int32
 	waitOnce   sync.Once
+}
+
+// outBucket 一秒的输出字节数（sec 是 Unix 秒）。
+type outBucket struct {
+	sec int64
+	n   int64
+}
+
+// countOutLocked 把一批 PTY 输出记进当前秒的桶（没有就抢占最旧的）。必须持 mu。
+func (s *termSession) countOutLocked(n int, now time.Time) {
+	sec := now.Unix()
+	for i := range s.outBuckets {
+		if s.outBuckets[i].sec == sec {
+			s.outBuckets[i].n += int64(n)
+			return
+		}
+	}
+	oldest := 0
+	for i := range s.outBuckets {
+		if s.outBuckets[i].sec < s.outBuckets[oldest].sec {
+			oldest = i
+		}
+	}
+	s.outBuckets[oldest] = outBucket{sec: sec, n: int64(n)}
+}
+
+// outBytesLocked 近 agentOutWindowSec 秒的输出字节总和（含当前秒）。必须持 mu。
+// 空闲秒没有桶（值为 0），跨秒空洞天然正确——只按 sec 比较即可。
+func (s *termSession) outBytesLocked(now time.Time) int64 {
+	floor := now.Unix() - int64(agentOutWindowSec) + 1
+	var sum int64
+	for i := range s.outBuckets {
+		if s.outBuckets[i].sec >= floor {
+			sum += s.outBuckets[i].n
+		}
+	}
+	return sum
 }
 
 // termClient 一条已 attach 的连接。off/live 由 session.mu 保护；wmu 串行化写。
@@ -631,10 +672,12 @@ func (s *termSession) pump() {
 		n, err := s.ptmx.Read(buf)
 		if n > 0 {
 			s.mu.Lock()
+			now := time.Now()
 			s.appendLocked(buf[:n])
 			s.scan.write(buf[:n])
-			s.lastOut = time.Now()
-			s.lastActive = s.lastOut
+			s.countOutLocked(n, now)
+			s.lastOut = now
+			s.lastActive = now
 			if s.scan.changed {
 				s.scan.changed = false
 				s.pushStateLocked()
@@ -701,16 +744,19 @@ func (s *termSession) sample(now time.Time, procs []procInfo) {
 	}
 	fg := foregroundPgid(s.ptmx.Fd())
 	v := classifyAgent(agentProbe{
-		procs:    procs,
-		fgPgid:   fg,
-		prevCPU:  s.prevCPU,
-		lastOut:  s.lastOut,
-		shellPID: s.pid,
-		now:      now,
+		procs:     procs,
+		fgPgid:    fg,
+		prevCPU:   s.prevCPU,
+		outBytes:  s.outBytesLocked(now),
+		prevState: s.state,
+		prevQuiet: s.prevQuiet,
+		shellPID:  s.pid,
+		now:       now,
 	})
 	if v.cpu >= 0 {
 		s.prevCPU = v.cpu
 	}
+	s.prevQuiet = v.quiet
 	if v.agent != s.agent || v.state != s.state {
 		s.agent, s.state = v.agent, v.state
 		if s.svc.logf != nil {
