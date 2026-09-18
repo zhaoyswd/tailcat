@@ -42,15 +42,34 @@ apply() {
   fi
 }
 
+# marker 取「最新一版补丁才有」的标识：老 marker（PATCH(tier): bootstrap candidates）在第一版
+# 补丁里就有，拿它判「已应用」会让「cache 里是旧一版补丁」被静默跳过 —— 旧补丁照样编得过、
+# CI 也照样绿，少掉的只是同 LAN 优先 / 发送失败降权 / 日志节流 / DERP 回退摘除那批修复。
+# tierNoHairpinAddr 是 2026-09-18 那批修复新增的。
+MARKER="tierNoHairpinAddr"
+
+if grep -q -- "PATCH(tier)" "$MOD/wgengine/magicsock/endpoint.go" \
+   && ! grep -q -- "$MARKER" "$MOD/wgengine/magicsock/endpoint.go"; then
+  echo "error: ${MOD} 里是**旧一版**补丁（有 PATCH(tier) 但没有 ${MARKER}）" >&2
+  echo "  修法：删掉该模块目录（${MOD}）后重新 go mod download，再跑本脚本" >&2
+  exit 1
+fi
+
 apply "magicsock 直连引导" \
   "$MOD/wgengine/magicsock/endpoint.go" \
-  "PATCH(tier): bootstrap candidates" \
+  "$MARKER" \
   "$PATCH_DIR/0001-magicsock-direct-bootstrap.patch"
 
-for f in "$MOD/wgengine/magicsock/endpoint.go" "$MOD/wgengine/magicsock/magicsock.go"; do
-  if ! grep -q -- "PATCH(tier)" "$f"; then
-    echo "error: 校验失败，补丁不完整：$f" >&2
+check() {
+  local file="$1" marker="$2"
+  if ! grep -q -- "$marker" "$file"; then
+    echo "error: 校验失败，补丁不完整（缺 ${marker}）：${file}" >&2
     exit 1
   fi
-done
-echo "[ok] tailscale.com@$WANT 补丁就绪（客户端 SetBootstrapCandidates / 出口 SetAcceptProvisionalInitiators）"
+}
+check "$MOD/wgengine/magicsock/endpoint.go" "$MARKER"
+check "$MOD/wgengine/magicsock/magicsock.go" "PATCH(tier)"
+check "$MOD/wgengine/magicsock/derp.go" "PATCH(tier #8)"
+check "$MOD/wgengine/magicsock/peermap.go" "rekeyEndpointLocked"
+check "$MOD/wgengine/magicsock/magicsock_test.go" "TestTierRoamingLearn"
+echo "[ok] tailscale.com@$WANT 补丁就绪（客户端 SetBootstrapCandidates / 出口 SetAcceptProvisionalInitiators + 候选策略/日志/DERP 回退修复）"

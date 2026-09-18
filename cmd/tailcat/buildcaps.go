@@ -24,21 +24,34 @@ import (
 // buildTagMaxLen 印进地址的构建号长度上限（v0.6.0-udp.18 是 13 字符）。
 // 超过就说明这不是发行版构建：go build 的版本是模块伪版本号
 // （v0.6.1-0.20260917023950-067ae990d51f+dirty 这种），go install 的是
-// 模块版本 —— 又长又没辨识度，白撑地址长度，统一压成 "dev"。
-const buildTagMaxLen = 20
+// 模块版本 —— 又长又没辨识度，白撑地址长度。
+const (
+	buildTagMaxLen = 20
+	buildTagHead   = 8
+	buildTagTail   = buildTagMaxLen - buildTagHead - 1 // 1 = 中间的 "~"
+)
 
 // forkBuildTag 印在地址里的构建号（诊断用），供客户端在日志/界面里显示
 // 「出口是哪个构建」。发行版构建照抄 tag 原文（`v0.6.0-udp.18`），
 // 便于与 Releases 页面对照。
 func forkBuildTag() string {
 	tag := strings.TrimSpace(versionString())
-	if len(tag) > buildTagMaxLen {
-		return "dev"
-	}
 	if tag == "" {
 		return "dev"
 	}
-	return tag
+	return truncateBuildTag(tag)
+}
+
+// truncateBuildTag 把超长版本串压成 `头8~尾11`。
+// ⚠️ **不要**压成笼统的 "dev"：那会把「这是哪个构建」这条诊断信息整个抹掉 ——
+// 真机上就表现成「手机里 Build=dev，查不出出口跑的是哪版，也看不出有没有重新部署」
+//（2026-09-18 排查 #11 时踩到）。伪版本号/`-dirty` 这类长串的版本主体在头、
+// 提交哈希与 dirty 标在尾，掐头留尾比一个 "dev" 有用得多。
+func truncateBuildTag(tag string) string {
+	if len(tag) <= buildTagMaxLen {
+		return tag
+	}
+	return tag[:buildTagHead] + "~" + tag[len(tag)-buildTagTail:]
 }
 
 // forkCaps 本构建支持的可选能力。新增可选功能时在这里加一位

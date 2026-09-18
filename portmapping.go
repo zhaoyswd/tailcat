@@ -330,26 +330,15 @@ func (lb *locoBackend) startPortMapping() {
 	}()
 }
 
-// localIPv4Candidates 列出本机可能用于 UPnP 的内网 IPv4 候选（跳过隧道/回环）。
+// localIPv4Candidates 列出本机可能用于 UPnP 的内网 IPv4 候选。
 // 不能只看默认路由接口：代理类工具（Surge 等）的 utun 常占着默认路由；也不能只取第一个，
-// 一台机器上常有多张虚拟网卡。真正的判据由调用方用 SSDP 自校验（谁能联系上路由器就用谁）。
+// 一台机器上常有多张虚拟网卡。过滤判据与直连候选通告同源（upnpIPv4Candidates →
+// isVirtualInterface）：bridge/docker/utun 上的地址拨不到路由器，留着只会白吃 SSDP 超时。
+// 真正的判据仍由调用方用 SSDP 自校验（谁能联系上路由器就用谁）。
 func (lb *locoBackend) localIPv4Candidates() []netip.Addr {
 	mon := lb.sys.NetMon.Get()
 	if mon == nil {
 		return nil
 	}
-	st := mon.InterfaceState()
-	var out []netip.Addr
-	for ifName, ips := range st.InterfaceIPs {
-		if ifName == "lo0" || strings.HasPrefix(ifName, "utun") || strings.HasPrefix(ifName, "tun") {
-			continue
-		}
-		for _, ip := range ips {
-			a := ip.Addr()
-			if a.Is4() && !a.IsLoopback() && !a.IsLinkLocalUnicast() {
-				out = append(out, a)
-			}
-		}
-	}
-	return out
+	return upnpIPv4Candidates(mon.InterfaceState().InterfaceIPs)
 }

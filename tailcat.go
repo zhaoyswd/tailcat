@@ -456,8 +456,11 @@ type locoBackend struct {
 	clients        map[key.NodePublic]*tailcfg.Node // for the server
 	nm             *netmap.NetworkMap
 	allowedClients map[key.NodePublic]bool // or nil map for all
-	eps            []netip.AddrPort        // our current local UDP endpoints, sorted
-	closeOnce      sync.Once
+	// epsDropped 是上一次「被过滤掉、未通告」的本机地址摘要（日志去重用；
+	// 过滤判据见 localaddr.go）。onEngineStatus 每拍都跑，摘要没变就不重复打。
+	epsDropped string
+	eps        []netip.AddrPort // our current local UDP endpoints, sorted
+	closeOnce  sync.Once
 
 	// advertiseMu 守护 advertiseFailed：直连会话里对端不在 DERP 上，
 	// SendDERPPacketTo 每轮都报 "does not know about peer"。同态失败每个
@@ -1788,9 +1791,30 @@ func (b *locoBackend) onEngineStatus(st *wgengine.Status, err error) {
 	if err != nil || st == nil {
 		return
 	}
+	// 只通告「对端可能真的到得了」的本机地址（#4/#13）：虚拟接口地址、网段地址
+	// （192.168.215.0/24 这种）与自己隧道地址会把对端的候选表灌满死地址 —— 真机
+	// 实测出口拿着这些地址每 5s ping 一次、全是 `sendto: no route to host`。
+	dropped := localAddrExclusionsNow(b.addrPrefix.Addr())
 	var eps []netip.AddrPort
+	var skipped map[netip.Addr]string
 	for _, ep := range st.LocalAddrs {
+		if why, ok := dropped[ep.Addr.Addr().Unmap()]; ok {
+			if skipped == nil {
+				skipped = map[netip.Addr]string{}
+			}
+			skipped[ep.Addr.Addr()] = why
+			continue
+		}
 		eps = append(eps, ep.Addr)
+	}
+	if summary := skippedAddrsSummary(skipped); summary != "" {
+		b.mu.Lock()
+		changed := summary != b.epsDropped
+		b.epsDropped = summary
+		b.mu.Unlock()
+		if changed {
+			b.logf("advertise: 跳过 %d 条不可达的本机地址（不作为直连候选通告）：%s", len(skipped), summary)
+		}
 	}
 	// 出口在路由器上做了固定端口映射（UPnP / 静态转发）时，把「公网 IPv4 + 该端口」
 	// 一并通告出去：对端于是有一个**不随重启变化**的地址可连，不必赌每次都会变的

@@ -1,6 +1,14 @@
 --- a/wgengine/magicsock/endpoint.go
 +++ b/wgengine/magicsock/endpoint.go
-@@ -104,6 +104,14 @@
+@@ -20,6 +20,7 @@
+ 	"sync/atomic"
+ 	"time"
+ 
++	"github.com/tailscale/wireguard-go/device"
+ 	"golang.org/x/net/ipv4"
+ 	"golang.org/x/net/ipv6"
+ 	"tailscale.com/disco"
+@@ -104,6 +105,33 @@
  	expired         bool // whether the node has expired
  	isWireguardOnly bool // whether the endpoint is WireGuard only. Must not be changed after initializing the endpont.
  	relayCapable    bool // whether the node is capable of speaking via a [tailscale.com/net/udprelay.Server]
@@ -12,20 +20,71 @@
 +	// network map version as soon as one exists, and they are exempt from the
 +	// network map cleanup that deletes endpoints for unknown node keys.
 +	provisional bool
++
++	// PATCH(tier #6): bootstrap 日志节流状态。直连引导期间每一次发送都会经过
++	// [endpoint.addrForSendLocked] 的 bootstrap 分支，原版实现每次都打一行
++	// 「first WG send to …」—— 真机实测 14s 内 1990 行、峰值 404 行/s，把核日志
++	// 刷爆（其余诊断全被顶掉）。改成「地址变化立即打，否则同址 5s 一条」，
++	// 被抑制的行数附在下一条上。
++	bootstrapLogAddr             netip.AddrPort
++	bootstrapLogAt               time.Time
++	bootstrapLogSuppressed       int
++	bootstrapMirrorLogAt         time.Time
++	bootstrapMirrorLogSuppressed int
++
++	// PATCH(tier #8): DERP 回退地址被服务端摘掉（PeerGone）后的重试状态。
++	// 没有控制面时判断不了「对端还在不在中继上」，只能信 DERP 服务端的
++	// PeerGone：摘掉 derpAddr（不再灌包、不再对上层报 via=derp），记住原来的
++	// 家，tierDerpRetryAfter 后自己重试一次，收到对端经 DERP 发来的包也立刻
++	// 恢复（见 noteDerpRouteGone / noteDerpRouteBack）。
++	derpHome   netip.AddrPort
++	derpGoneAt time.Time
  }
  
  // udpRelayEndpointReady determines whether the given relay [addrQuality] should
-@@ -572,10 +580,73 @@
- 	de.fakeWGAddr = netip.AddrPortFrom(netip.AddrFrom16(addr).Unmap(), 12345)
+@@ -470,6 +498,12 @@
+ 	// callMeMaybeTime, if non-zero, is the time this endpoint
+ 	// was advertised last via a call-me-maybe disco message.
+ 	callMeMaybeTime time.Time
++
++	// PATCH(tier #3): 直连候选的发送失败记账（de.mu 保护）。
++	// sendFails 是**连续**发送失败次数（收到该地址的包、收到它的 pong 即清零）；
++	// lastFailAt 是最近一次失败的墙钟时刻。见 [endpoint.noteSendFailure]。
++	sendFails  int
++	lastFailAt time.Time
+ 
+ 	recentPongs []pongReply // ring buffer up to pongHistoryCount entries
+ 	recentPong  uint16      // index into recentPongs of most recent; older before, wrapped
+@@ -519,6 +553,18 @@
+ 	}
  }
  
++// pingInterval returns how long to wait between discovery pings for this
++// candidate. Candidates whose sends keep failing back off (PATCH tier #3) so a
++// dead address cannot soak up one ping every discoPingInterval forever.
++//
++// endpoint.mu must be held.
++func (st *endpointState) pingInterval() time.Duration {
++	if st.sendFails >= tierSendFailLimit {
++		return tierSendFailBackoff
++	}
++	return discoPingInterval
++}
++
+ // latencyLocked returns the most recent latency measurement, if any.
+ // endpoint.mu must be held.
+ func (st *endpointState) latencyLocked() (lat time.Duration, ok bool) {
+@@ -571,11 +617,132 @@
+ 	binary.BigEndian.PutUint64(addr[2:], uint64(reflect.ValueOf(de).Pointer()))
+ 	de.fakeWGAddr = netip.AddrPortFrom(netip.AddrFrom16(addr).Unmap(), 12345)
+ }
 +// tierLearnedEndpointMax caps the number of direct candidates learned from
 +// received packets (see noteDirectCandidate), so a peer that sprays packets
 +// from many source ports cannot grow the candidate set without bound. Entries
 +// age out on their own (sessionActiveTimeout), so this is a ceiling, not a
 +// quota.
 +const tierLearnedEndpointMax = 16
-+
+ 
 +// PATCH(tier #10.3.1b): noteDirectCandidate records src.ap as a live direct
 +// path for de — the WireGuard roaming rule ("a packet we just received provably
 +// came from the address we received it from"). An unknown address is added as a
@@ -55,6 +114,8 @@
 +		if !st.lastGotPing.IsZero() {
 +			st.lastGotPing = time.Now()
 +		}
++		// PATCH(tier #3): 这个地址刚有包进来 = 它显然能收（发送失败记账清零）。
++		st.sendFails = 0
 +	} else if len(de.endpointState) >= tierLearnedEndpointMax {
 +		return
 +	} else {
@@ -62,15 +123,72 @@
 +		de.c.logf("magicsock: 为 peer %v 登记收到包的源地址 %v 作直连候选（候选数 %d）",
 +			de.publicKey.ShortString(), src.ap, len(de.endpointState))
 +	}
-+	// 收到包的地址就是「响应该回去的地方」：无条件把 best 换成它（短信任窗，与
-+	// wireguard-only peer 的既有漫游语义一致）。这不是可选项 —— 出口上一代会话的
-+	// best 可能还在信任窗内（换网/重连后它已是个死地址），此时若不动 best，握手
-+	// 响应会发给旧地址，客户端要等信任窗过期后的重试才连得上（真机实测 5s 起步，
-+	// 更糟的情况是永远连不上）。
++	// 收到包的地址就是「响应该回去的地方」。但**不能无条件**抢过 best（#2）：
++	// 双端都会把对端的公网地址学成候选，同 LAN 场景下那个地址要 NAT 回环才通
++	//（家用路由器普遍不回环），无条件采纳会让 best 落在一条发不出去的路径上 ——
++	// 真机 2026-09-18 08:30：手机与 Mac 出口同在家网段，双端 best 都落在公网
++	// 地址上，握手响应进不了 LAN，隧道一直挂中继，用户视角「没有恢复直连」。
++	//
++	// 采纳判据（其余情况保持 best 不动，避免同一 peer 多路径来回抖）：
++	//   ① best 无效 / 已过信任窗 → 采纳（恢复路径，语义与上一版一致）；
++	//   ② 新地址不需要 NAT 回环（私网/回环/链路本地）而当前 best 需要 → 采纳
++	//      （同 LAN 优先）；
++	//   ③ 当前 best 的候选已经 2s 没有收到过包（lastGotPing 陈旧）→ 采纳
++	//      （对端换地址/换网时及时跟随，与 WireGuard roaming 语义一致）。
++	switch {
++	case !de.bestAddr.ap.IsValid() || now.After(de.trustBestAddrUntil):
++	case !tierNoHairpinAddr(de.bestAddr.ap) && tierNoHairpinAddr(src.ap):
++	case tierBestRecvStale(de.endpointState, de.bestAddr.ap, time.Now()):
++	default:
++		return
++	}
 +	de.setBestAddrLocked(addrQuality{epAddr: src})
 +	de.bestAddrAt = now
 +	de.trustBestAddrUntil = now.Add(5 * time.Second)
 +}
++
++// tierNoHairpinAddr reports whether ap is an address a same-LAN peer can reach
++// without NAT hairpinning (RFC1918, loopback or link-local). PATCH(tier #2).
++func tierNoHairpinAddr(ap netip.AddrPort) bool {
++	a := ap.Addr()
++	return a.IsPrivate() || a.IsLoopback() || a.IsLinkLocalUnicast()
++}
++
++// tierBestRecvStale reports whether the current best address has gone quiet:
++// a runtime-learned candidate (lastGotPing non-zero, i.e. we have received
++// packets from it at some point) whose last received packet is older than
++// tierBestStaleAfter. Candidates that came from the network map (lastGotPing
++// zero) are never reported stale — they have no receive bookkeeping of their
++// own. PATCH(tier #2).
++func tierBestRecvStale(states map[netip.AddrPort]*endpointState, best netip.AddrPort, now time.Time) bool {
++	st, ok := states[best]
++	if !ok || st.lastGotPing.IsZero() {
++		return false
++	}
++	return now.Sub(st.lastGotPing) > tierBestStaleAfter
++}
++
++// PATCH(tier): constants for the direct-candidate policies above.
++const (
++	// tierBestStaleAfter is how long the current best address may go without
++	// receiving a packet before a packet from another address takes over.
++	tierBestStaleAfter = 2 * time.Second
++
++	// tierSendFailLimit is how many consecutive send failures mark a direct
++	// candidate as dead. See [endpoint.noteSendFailure].
++	tierSendFailLimit = 3
++
++	// tierSendFailBackoff is how long a dead *network map* candidate is kept out
++	// of the ping rotation (runtime-learned ones are dropped outright).
++	tierSendFailBackoff = 60 * time.Second
++
++	// tierBootstrapLogEvery throttles the bootstrap "first WG send" log lines.
++	tierBootstrapLogEvery = 5 * time.Second
++
++	// tierDerpRetryAfter is how long a PeerGone-suppressed DERP fallback address
++	// is kept out of the send path before it is retried once.
++	tierDerpRetryAfter = 30 * time.Second
++)
 +
  // noteRecvActivity records receive activity on de, and invokes
  // Conn.noteRecvActivity no more than once every 10s, returning true if it
@@ -89,12 +207,20 @@
  	if de.isWireguardOnly {
  		de.mu.Lock()
  		de.bestAddr.ap = src.ap
-@@ -641,6 +712,21 @@
- 		// address to send to, so we have to send to the UDP address.
- 		udpAddr, shouldPing := de.addrForWireGuardSendLocked(now)
+@@ -630,6 +797,9 @@
+ //
+ // TODO(val): Rewrite the addrFor*Locked() variations to share code.
+ func (de *endpoint) addrForSendLocked(now mono.Time) (udpAddr epAddr, derpAddr netip.AddrPort, sendWGPing bool) {
++	// PATCH(tier #8): 被 PeerGone 摘掉的 DERP 回退地址在 tierDerpRetryAfter 后自己
++	// 再试一次（对端重新连上中继后要能恢复；期间既不灌包也不报 via=derp）。
++	de.maybeRestoreDerpAddrLocked()
+ 	udpAddr = de.bestAddr.epAddr
+ 
+ 	if udpAddr.ap.IsValid() && !now.After(de.trustBestAddrUntil) {
+@@ -643,11 +813,103 @@
  		return udpAddr, netip.AddrPort{}, shouldPing
-+	}
-+
+ 	}
+ 
 +	// PATCH(tier): bootstrap candidates. We have no trusted bestAddr, so
 +	// normally there is nothing to send to but DERP. If the caller asked for
 +	// bootstrap sends ([Conn.SetBootstrapCandidates]) and we do have candidate
@@ -105,12 +231,314 @@
 +	// simply mirrored on both paths, exactly like the expired-bestAddr case
 +	// below).
 +	if de.c.bootstrapCandidates.Load() && !udpAddr.ap.IsValid() && len(de.endpointState) > 0 {
-+		if candidate, _ := de.addrForWireGuardSendLocked(now); candidate.ap.IsValid() {
++		// PATCH(tier): prefer a candidate that is directly reachable (private /
++		// ULA / link-local) over a public one. Rationale: hint candidates often
++		// include the peer's public address, and in the same-LAN case reaching
++		// it requires NAT hairpinning, whose handshake response is regularly
++		// lost — the first initiation would then be wasted (WireGuard will not
++		// send a fresh one for RekeyTimeout=5s), which is exactly the "wait for
++		// the relay instead of going direct" behaviour this patch exists to
++		// remove.
++		if candidate, ok := de.bootstrapCandidatePreferredLocked(); ok {
 +			udpAddr = candidate
++			de.logBootstrapSendLocked(candidate.ap, true, len(de.endpointState))
++		} else if candidate, _ := de.addrForWireGuardSendLocked(now); candidate.ap.IsValid() {
++			udpAddr = candidate
++			de.logBootstrapSendLocked(candidate.ap, false, len(de.endpointState))
 +		}
- 	}
- 
++	}
++
  	// We had a bestAddr but it expired so send both to it
+ 	// and DERP.
+ 	return udpAddr, de.derpAddr, false
+ }
+ 
++// PATCH(tier #8): maybeRestoreDerpAddrLocked gives a PeerGone-suppressed DERP
++// fallback address another chance once tierDerpRetryAfter has passed. The peer
++// reconnects to DERP on its own schedule (our DERP client has no visibility into
++// that), so a timed retry is the only recovery trigger we have; a retry is cheap
++// (one queued packet) and a still-absent peer answers with PeerGone again.
++//
++// de.mu must be held.
++func (de *endpoint) maybeRestoreDerpAddrLocked() {
++	if de.derpAddr.IsValid() || !de.derpHome.IsValid() || de.derpGoneAt.IsZero() {
++		return
++	}
++	if time.Since(de.derpGoneAt) < tierDerpRetryAfter {
++		return
++	}
++	from := de.derpHome
++	de.derpAddr = de.derpHome
++	de.derpHome = netip.AddrPort{}
++	de.derpGoneAt = time.Time{}
++	de.debugUpdates.Add(EndpointChange{When: time.Now(), What: "maybeRestoreDerpAddr", From: from, To: de.derpAddr})
++}
++
++// PATCH(tier #6): logBootstrapSendLocked logs the bootstrap "first WG send" line,
++// throttled: the address changing is always worth a line, the same address only
++// once every tierBootstrapLogEvery. Suppressed line counts are reported on the
++// next line that is printed, so the log still shows how chatty it was.
++//
++// de.mu must be held.
++func (de *endpoint) logBootstrapSendLocked(ap netip.AddrPort, preferred bool, candidates int) {
++	now := time.Now()
++	if ap == de.bootstrapLogAddr && now.Sub(de.bootstrapLogAt) < tierBootstrapLogEvery {
++		de.bootstrapLogSuppressed++
++		return
++	}
++	suffix := ""
++	if n := de.bootstrapLogSuppressed; n > 0 {
++		suffix = fmt.Sprintf("；已抑制 %d 行同类日志", n)
++		de.bootstrapLogSuppressed = 0
++	}
++	de.bootstrapLogAddr = ap
++	de.bootstrapLogAt = now
++	if preferred {
++		de.c.logf("magicsock: [tier] bootstrap: first WG send to %v (preferred of %d candidates)%s",
++			ap, candidates, suffix)
++		return
++	}
++	de.c.logf("magicsock: [tier] bootstrap: first WG send to %v (of %d candidates)%s",
++		ap, candidates, suffix)
++}
++
++// bootstrapCandidatePreferredLocked returns a candidate address that does not
++// need a NAT hairpin to be reached (private RFC1918, ULA RFC4193, link-local or
++// loopback), if the endpoint has one. Used by [endpoint.addrForSendLocked] in
++// the direct-bootstrap case: see the PATCH(tier) comment there.
++//
++// de.mu must be held.
++func (de *endpoint) bootstrapCandidatePreferredLocked() (epAddr, bool) {
++	for ap := range de.endpointState {
++		a := ap.Addr()
++		if a.IsPrivate() || a.IsLoopback() || a.IsLinkLocalUnicast() {
++			return epAddr{ap: ap}, true
++		}
++	}
++	return epAddr{}, false
++}
++
+ // addrForWireGuardSendLocked returns the address that should be used for
+ // sending the next packet. If a packet has never or not recently been sent to
+ // the endpoint, then a randomly selected address for the endpoint is returned,
+@@ -668,6 +930,11 @@
+ 	lowestLatency := time.Hour
+ 	var oldestPing mono.Time
+ 	for ipp, state := range de.endpointState {
++		// PATCH(tier #3): 发送失败到阈值的候选不再参与选路 —— 它已经被证伪，
++		// 随机挑中它只会把包丢进黑洞（它连 sendto 都出不去）。
++		if state.sendFails >= tierSendFailLimit {
++			continue
++		}
+ 		if oldestPing.IsZero() {
+ 			oldestPing = state.lastPing
+ 		} else if state.lastPing.Before(oldestPing) {
+@@ -688,6 +955,14 @@
+ 
+ 	if !udpAddr.ap.IsValid() {
+ 		candidates := slicesx.MapKeys(de.endpointState)
++		// PATCH(tier #3): 随机候选里同样剔掉被证伪的地址；全被剔光时退回原集合
++		//（宁可随机也不返回零地址 —— 零地址会走 DERP 回退，失去直连机会）。
++		if alive := slices.DeleteFunc(slices.Clone(candidates), func(ap netip.AddrPort) bool {
++			st, ok := de.endpointState[ap]
++			return ok && st.sendFails >= tierSendFailLimit
++		}); len(alive) > 0 {
++			candidates = alive
++		}
+ 
+ 		// Randomly select an address to use until we retrieve latency information
+ 		// and give it a short trustBestAddrUntil time so we avoid flapping between
+@@ -1107,6 +1382,45 @@
+ 
+ 	now := mono.Now()
+ 	udpAddr, derpAddr, startWGPing := de.addrForSendLocked(now)
++
++	// PATCH(tier): bootstrap mirror. Before any path to the peer has been
++	// verified we are guessing at its address, and WireGuard will only
++	// retransmit the same handshake initiation for RekeyTimeout (5s): a wrong
++	// first guess therefore wastes the whole direct-connect window and the
++	// relay wins meanwhile (measured on-device: the first pick was a stale
++	// learned address, the probe never saw a handshake, meow won ~2s later).
++	// Mirror handshake initiations to every other known candidate as well, so
++	// the handshake completes on the first attempt whenever *any* of the
++	// candidates is reachable. Only handshake initiations (rare: bootstrap and
++	// the 5s retransmit timer), never data packets.
++	var bootstrapMirror []epAddr
++	if de.c.bootstrapCandidates.Load() &&
++		(!de.bestAddr.ap.IsValid() || now.After(de.trustBestAddrUntil)) &&
++		len(de.endpointState) > 1 &&
++		len(buffs) > 0 && offset < len(buffs[0]) && buffs[0][offset] == device.MessageInitiationType {
++		for ap := range de.endpointState {
++			if ap == udpAddr.ap {
++				continue
++			}
++			bootstrapMirror = append(bootstrapMirror, epAddr{ap: ap})
++		}
++		if len(bootstrapMirror) > 0 {
++			// PATCH(tier #7): 镜像日志同样节流 —— 它与下面的 first-send 行在真机上
++			// 一起构成 404 行/s 的洪泛（数据面上每个握手包都会走到这里）。
++			if now2 := time.Now(); now2.Sub(de.bootstrapMirrorLogAt) >= tierBootstrapLogEvery {
++				suffix := ""
++				if n := de.bootstrapMirrorLogSuppressed; n > 0 {
++					suffix = fmt.Sprintf("；已抑制 %d 行同类日志", n)
++					de.bootstrapMirrorLogSuppressed = 0
++				}
++				de.bootstrapMirrorLogAt = now2
++				de.c.logf("magicsock: [tier] bootstrap: mirror WG handshake %v -> %v (candidates=%d)%s",
++					udpAddr.ap, bootstrapMirror, len(de.endpointState), suffix)
++			} else {
++				de.bootstrapMirrorLogSuppressed++
++			}
++		}
++	}
+ 
+ 	if de.isWireguardOnly {
+ 		if startWGPing {
+@@ -1137,6 +1451,14 @@
+ 	if udpAddr.ap.IsValid() {
+ 		_, err = de.c.sendUDPBatch(udpAddr, buffs, offset)
+ 
++		// PATCH(tier): the bootstrap mirror above is best-effort: send the same
++		// datagrams (one handshake initiation) to the remaining candidates
++		// without touching metrics or the error path — whichever candidate is
++		// reachable answers, and the handshake is done in one round trip.
++		for _, mirror := range bootstrapMirror {
++			_, _ = de.c.sendUDPBatch(mirror, buffs, offset)
++		}
++
+ 		// If the error is known to indicate that the endpoint is no longer
+ 		// usable, clear the endpoint statistics so that the next send will
+ 		// re-evaluate the best endpoint.
+@@ -1426,7 +1748,7 @@
+ 		if runtime.GOOS == "js" {
+ 			continue
+ 		}
+-		if !st.lastPing.IsZero() && now.Sub(st.lastPing) < discoPingInterval {
++		if !st.lastPing.IsZero() && now.Sub(st.lastPing) < st.pingInterval() {
+ 			continue
+ 		}
+ 
+@@ -1854,8 +2176,59 @@
+ 	if !udpAddr.vni.IsSet() {
+ 		if st, ok := de.endpointState[udpAddr.ap]; ok {
+ 			st.clear()
++			// PATCH(tier #3): 数据面的发送失败同样计入候选降权（见 noteSendFailure）。
++			de.noteSendFailureLocked(udpAddr.ap)
+ 		}
++	}
++}
++
++// PATCH(tier #3): noteSendFailure records a failed send to a direct candidate
++// and demotes it once it has failed tierSendFailLimit times in a row.
++//
++// Without a control plane magicsock treats every candidate as potentially
++// reachable and keeps probing it: on-device the exit pinged a dead LAN address of
++// the phone (192.168.3.54:52085, `sendto: no route to host`) every 5s for 8
++// minutes (320+ log lines) while bestAddr kept pointing at it. The judgement here
++// is deliberately errno-free: any send error from the direct path counts, so it
++// also works on platforms where [isBadEndpointErr] has no EHOSTUNREACH to match.
++//
++// Runtime-learned candidates (lastGotPing/callMeMaybeTime non-zero) are dropped
++// outright — the peer re-learns them by sending us a packet, and DERP stays as
++// the fallback. Network-map candidates cannot be dropped; they get a ping backoff
++// instead. Either way the candidate stops being the best address.
++func (de *endpoint) noteSendFailure(ap netip.AddrPort) {
++	de.mu.Lock()
++	defer de.mu.Unlock()
++	de.noteSendFailureLocked(ap)
++}
++
++// noteSendFailureLocked is [endpoint.noteSendFailure] with de.mu held.
++//
++// de.mu must be held.
++func (de *endpoint) noteSendFailureLocked(ap netip.AddrPort) {
++	st, ok := de.endpointState[ap]
++	if !ok {
++		return
++	}
++	st.sendFails++
++	st.lastFailAt = time.Now()
++	if de.bestAddr.ap == ap {
++		// 下一次发送重新选路；否则会一直往这条发不出去的路重试。
++		de.clearBestAddrLocked()
++	}
++	if st.sendFails < tierSendFailLimit {
++		return
++	}
++	if !st.lastGotPing.IsZero() || !st.callMeMaybeTime.IsZero() {
++		de.c.logf("magicsock: [tier] 直连候选 %v 连续 %d 次发送失败，摘除（运行时学习，对端再发包即恢复）",
++			ap, st.sendFails)
++		de.deleteEndpointLocked("sendFailure", ap)
++		return
+ 	}
++	if st.sendFails == tierSendFailLimit {
++		de.c.logf("magicsock: [tier] 直连候选 %v 连续 %d 次发送失败，探测退避 %v（网络地图候选，不摘除）",
++			ap, st.sendFails, tierSendFailBackoff)
++	}
+ }
+ 
+ // noteConnectivityChange is called when connectivity changes enough
+@@ -1869,9 +2242,51 @@
+ 
+ 	for k := range de.endpointState {
+ 		de.endpointState[k].clear()
++		// PATCH(tier #3): 换网后发送失败记账一并清零 —— 旧地址的失败是旧网络
++		// 的事实，新网络下要重新给机会（否则退避会跨网络生效）。
++		de.endpointState[k].sendFails = 0
+ 	}
+ }
+ 
++// PATCH(tier #8): noteDerpRouteGone clears the DERP fallback address of a peer
++// that the DERP server has just reported gone (PeerGone). Until this can be
++// re-confirmed we do not offer DERP as a send path and do not report via=derp:
++// without a control plane there is no other way to tell "the relay knows this
++// peer" apart from "the relay is silently dropping everything".
++//
++// The cleared address is remembered in derpHome and retried after
++// tierDerpRetryAfter (see maybeRestoreDerpAddrLocked), or immediately when a
++// packet from the peer arrives over DERP (see noteDerpRouteBack).
++//
++// de.mu must be held.
++func (de *endpoint) noteDerpRouteGone(regionID tailcfg.DERPRegionID) {
++	if de.derpAddr.Addr() != tailcfg.DerpMagicIPAddr || tailcfg.DERPRegionID(de.derpAddr.Port()) != regionID {
++		return
++	}
++	when := time.Now()
++	de.derpHome = de.derpAddr
++	de.derpAddr = netip.AddrPort{}
++	de.derpGoneAt = when
++	de.debugUpdates.Add(EndpointChange{When: when, What: "noteDerpRouteGone", From: de.derpHome})
++	de.c.logf("magicsock: [tier] derp-%d 不认识 peer %v：摘掉 DERP 回退地址（%v 后重试）",
++		regionID, de.publicKey.ShortString(), tierDerpRetryAfter)
++}
++
++// PATCH(tier #8): noteDerpRouteBack reinstates the DERP fallback address once the
++// peer has been seen on DERP again.
++//
++// de.mu must be held.
++func (de *endpoint) noteDerpRouteBack(regionID tailcfg.DERPRegionID) {
++	ap := netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(regionID))
++	if de.derpAddr == ap {
++		return
++	}
++	de.debugUpdates.Add(EndpointChange{When: time.Now(), What: "noteDerpRouteBack", To: ap})
++	de.derpAddr = ap
++	de.derpHome = netip.AddrPort{}
++	de.derpGoneAt = time.Time{}
++}
++
+ // pingSizeToPktLen calculates the minimum path MTU that would permit
+ // a disco ping message of length size to reach its target at
+ // udpAddr. size is the length of the entire disco message including
+@@ -1951,6 +2366,8 @@
+ 
+ 		de.c.peerMap.setNodeKeyForEpAddr(src, de.publicKey)
+ 
++		// PATCH(tier #3): 这个地址能收能回 —— 发送失败记账清零。
++		st.sendFails = 0
+ 		st.addPongReplyLocked(pongReply{
+ 			latency: latency,
+ 			pongAt:  now,
 --- a/wgengine/magicsock/magicsock.go
 +++ b/wgengine/magicsock/magicsock.go
 @@ -425,6 +425,29 @@
@@ -143,10 +571,40 @@
  }
  
  // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
-@@ -2817,6 +2840,184 @@
+@@ -1531,7 +1554,7 @@
+ 		err = c.pconn4.WriteWireGuardBatchTo(buffs, addr, offset)
+ 	}
+ 	if err != nil {
+-		if errGSO, ok := errors.AsType[neterror.ErrUDPGSODisabled](err); ok {
++		if errGSO, ok := probeAsType[neterror.ErrUDPGSODisabled](err); ok {
+ 			c.logf("magicsock: %s", errGSO.Error())
+ 			err = errGSO.RetryErr
+ 		} else {
+@@ -2037,6 +2060,18 @@
+ 	} else {
+ 		if !c.networkDown() && pmtuShouldLogDiscoTxErr(m, err) {
+ 			c.logf("magicsock: disco: failed to send %v to %v %s: %v", disco.MessageSummary(m), dst, dstKey.ShortString(), err)
++		}
++		// PATCH(tier #3): 直连候选的发送失败要记账（否则一条死地址会被每 5s
++		// 白 ping 一次、还可能是 bestAddr）；DERP 目标与 MTU 探测错误不计。
++		// 注意锁序：先取 c.mu 拿 endpoint 指针（peerMap 由 c.mu 守护），释放后再取
++		// de.mu —— sendDiscoMessage 的调用方都不持有这两把锁。
++		if !isDERP && !errors.Is(err, errEMSGSIZE) {
++			c.mu.Lock()
++			ep, ok := c.peerMap.endpointForEpAddr(dst)
++			c.mu.Unlock()
++			if ok {
++				ep.noteSendFailure(dst.ap)
++			}
+ 		}
+ 	}
+ 	return sent, err
+@@ -2815,6 +2850,184 @@
+ 	c.peerMap.forEachEndpoint(func(ep *endpoint) {
+ 		ep.setHeartbeatDisabled(v)
  	})
- }
- 
++}
++
 +// PATCH(tier): bounds for endpoints synthesized from inbound handshakes.
 +const (
 +	// provisionalEndpointMax caps how many unknown-key endpoints we hold at
@@ -199,6 +657,45 @@
 +		}
 +		delete(c.provisionalPeers, k)
 +	}
++}
++
++// adoptProvisionalEndpointLocked turns a provisional endpoint (synthesized
++// from a direct handshake, see upsertProvisionalEndpointLocked) into the
++// network map's version of that peer, **in place**.
++//
++// Why in place: the WireGuard device pins the endpoint object it was given when
++// the peer was created (lazily, via [Conn.ParseEndpoint]) and never roams to a
++// different object. Replacing the object (delete + create) therefore leaves
++// the device sending handshake responses and data through an orphaned endpoint
++// that can no longer learn anything: with no control plane the *received*
++// packets are the only source of path knowledge, and after the swap those go to
++// the new object. The orphaned one keeps its stale candidate list — or, once
++// the session expires, none at all — and the tunnel stays up while every
++// self-dialed connection through it dies.
++//
++// The network map is still authoritative for everything it carries (node ID,
++// disco key, DERP home, endpoints, WireGuard-only-ness): the caller runs the
++// ordinary update path on the same object right after.
++//
++// c.mu must be held.
++func (c *Conn) adoptProvisionalEndpointLocked(ep *endpoint, n tailcfg.NodeView) {
++	oldID := ep.nodeID
++	ep.nodeID = n.ID()
++	ep.provisional = false
++	ep.isWireguardOnly = n.IsWireGuardOnly()
++	delete(c.provisionalPeers, ep.publicKey)
++	if n.Addresses().Len() > 0 {
++		ep.nodeAddr = n.Addresses().At(0).Addr()
++	}
++	// The TSMP marker was a provisional-phase placeholder ("no control disco
++	// key known yet"). The network map brings the peer's real disco key, so
++	// drop it: [endpoint.updateDiscoKey] keeps a set tsmpActive flag sticky,
++	// and a peer with an active TSMP key would have disco sent to the empty
++	// TSMP key instead of the peer's real one.
++	ep.disco.Store(&endpointDisco{})
++	c.peerMap.rekeyEndpointLocked(ep, oldID)
++	c.logf("magicsock: provisional peer %v adopted by the network map in place (nodeID %v→%v, wgonly=%v, candidates=%d)",
++		ep.publicKey.ShortString(), oldID, ep.nodeID, ep.isWireguardOnly, len(ep.endpointState))
 +}
 +
 +// provisionalNodeID returns a node ID for a synthesized endpoint. It must be
@@ -284,51 +781,10 @@
 +	c.logf("magicsock: provisional peer %v learned from %v (direct handshake, no network map)",
 +		pubKey.ShortString(), src)
 +	return ep, true
-+}
-+
-+// adoptProvisionalEndpointLocked turns a provisional endpoint (synthesized
-+// from a direct handshake, see upsertProvisionalEndpointLocked) into the
-+// network map's version of that peer, **in place**.
-+//
-+// Why in place: the WireGuard device pins the endpoint object it was given when
-+// the peer was created (lazily, via [Conn.ParseEndpoint]) and never roams to a
-+// different object. Replacing the object (delete + create) therefore leaves
-+// the device sending handshake responses and data through an orphaned endpoint
-+// that can no longer learn anything: with no control plane the *received*
-+// packets are the only source of path knowledge, and after the swap those go to
-+// the new object. The orphaned one keeps its stale candidate list — or, once
-+// the session expires, none at all — and the tunnel stays up while every
-+// self-dialed connection through it dies.
-+//
-+// The network map is still authoritative for everything it carries (node ID,
-+// disco key, DERP home, endpoints, WireGuard-only-ness): the caller runs the
-+// ordinary update path on the same object right after.
-+//
-+// c.mu must be held.
-+func (c *Conn) adoptProvisionalEndpointLocked(ep *endpoint, n tailcfg.NodeView) {
-+	oldID := ep.nodeID
-+	ep.nodeID = n.ID()
-+	ep.provisional = false
-+	ep.isWireguardOnly = n.IsWireGuardOnly()
-+	delete(c.provisionalPeers, ep.publicKey)
-+	if n.Addresses().Len() > 0 {
-+		ep.nodeAddr = n.Addresses().At(0).Addr()
-+	}
-+	// The TSMP marker was a provisional-phase placeholder ("no control disco
-+	// key known yet"). The network map brings the peer's real disco key, so
-+	// drop it: [endpoint.updateDiscoKey] keeps a set tsmpActive flag sticky,
-+	// and a peer with an active TSMP key would have disco sent to the empty
-+	// TSMP key instead of the peer's real one.
-+	ep.disco.Store(&endpointDisco{})
-+	c.peerMap.rekeyEndpointLocked(ep, oldID)
-+	c.logf("magicsock: provisional peer %v adopted by the network map in place (nodeID %v→%v, wgonly=%v, candidates=%d)",
-+		ep.publicKey.ShortString(), oldID, ep.nodeID, ep.isWireguardOnly, len(ep.endpointState))
-+}
-+
+ }
+ 
  // SilentDisco returns true if silent disco is enabled, otherwise false.
- func (c *Conn) SilentDisco() bool {
- 	c.mu.Lock()
-@@ -3135,7 +3336,11 @@
+@@ -3135,7 +3348,11 @@
  			keep.Add(n.Key())
  		}
  		c.peerMap.forEachEndpoint(func(ep *endpoint) {
@@ -341,7 +797,7 @@
  				c.peerMap.deleteEndpoint(ep)
  			}
  		})
-@@ -3172,6 +3377,18 @@
+@@ -3172,6 +3389,18 @@
  		c.peerMap.deleteEndpoint(ep)
  		ok = false
  	}
@@ -360,7 +816,15 @@
  	if ok {
  		// At this point we're modifying an existing endpoint (ep) whose
  		// public key and nodeID match n. Its other fields (such as disco
-@@ -4394,6 +4611,15 @@
+@@ -3199,7 +3428,6 @@
+ 		c.peerMap.upsertEndpoint(ep, oldDiscoKey, false)
+ 		return
+ 	}
+-
+ 	if ep, ok := c.peerMap.endpointForNodeKey(n.Key()); ok {
+ 		// At this point n.Key() should be for a key we've never seen before. If
+ 		// ok was true above, it was an update to an existing matching key and
+@@ -4394,6 +4622,15 @@
  	}
  	le.c.mu.Lock()
  	ep, ok := le.c.peerMap.endpointForNodeKey(pubKey)
@@ -376,33 +840,128 @@
  	le.c.mu.Unlock()
  	if !ok {
  		return
+@@ -4587,3 +4824,26 @@
+ 	}
+ 	return netip.Addr{}
+ }
++
++// probeAsType is a go1.24-compatible stand-in for errors.AsType (added by this
++// project's OHOS porting script; the App core builds with go1.24.5).
++func probeAsType[E error](err error) (e E, ok bool) {
++	for cur := err; cur != nil; {
++		if e, ok = cur.(E); ok {
++			return e, true
++		}
++		switch x := cur.(type) {
++		case interface{ Unwrap() error }:
++			cur = x.Unwrap()
++		case interface{ Unwrap() []error }:
++			if l := x.Unwrap(); len(l) > 0 {
++				cur = l[0]
++			} else {
++				return e, false
++			}
++		default:
++			return e, false
++		}
++	}
++	return e, false
++}
+--- a/wgengine/magicsock/derp.go
++++ b/wgengine/magicsock/derp.go
+@@ -66,6 +66,23 @@
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 	mak.Set(&c.derpRoute, peer, derpRoute{regionID, dc})
++	// PATCH(tier #8): 收到对端经 DERP 发来的包 = 它确实在这个中继上，把被
++	// PeerGone 摘掉的回退地址立刻恢复（不必等 tierDerpRetryAfter 到点）。
++	if ep, ok := c.peerMap.endpointForNodeKey(peer); ok {
++		ep.noteDerpRouteBack(regionID)
++	}
++}
++
++// PATCH(tier #8): noteDerpPeerGoneNotHere tells the peer's endpoint that DERP
++// regionID no longer knows about it, so the endpoint stops offering DERP as a
++// usable path (see [endpoint.noteDerpRouteGone]).
++func (c *Conn) noteDerpPeerGoneNotHere(peer key.NodePublic, regionID tailcfg.DERPRegionID) {
++	c.mu.Lock()
++	ep, ok := c.peerMap.endpointForNodeKey(peer)
++	c.mu.Unlock()
++	if ok {
++		ep.noteDerpRouteGone(regionID)
++	}
+ }
+ 
+ // fallbackDERPRegionForPeer returns the DERP region ID we might be able to use
+@@ -663,6 +680,11 @@
+ 					regionID, key.NodePublic(m.Peer).ShortString(), m.Reason)
+ 			}
+ 			c.removeDerpPeerRoute(key.NodePublic(m.Peer), regionID, dc)
++			// PATCH(tier #8): 服务端明确说「这个 peer 不在这里」——把该 peer 的
++			// DERP 回退地址一并摘掉（带 TTL 自动重试）。不摘的话：发送端会一直往
++			// 一个不认识该 peer 的中继里灌包（包被静默丢弃），状态里还会报
++			// via=derp —— 上层据此认为「链路在」，实际什么都不通。
++			c.noteDerpPeerGoneNotHere(key.NodePublic(m.Peer), regionID)
+ 			continue
+ 		default:
+ 			// Ignore.
+--- a/wgengine/magicsock/peermap.go
++++ b/wgengine/magicsock/peermap.go
+@@ -225,7 +225,21 @@
+ 		}
+ 		pi.epAddrs.Add(addr)
+ 		m.byEpAddr[addr] = pi
++	}
++}
++
++// rekeyEndpointLocked moves ep in the byNodeID index from oldID to ep.nodeID.
++// It is used when an endpoint adopted from a provisional peer (see
++// [Conn.adoptProvisionalEndpointLocked]) trades its synthetic node ID for the
++// network map's real one; the two IDs must never both resolve to the same peer,
++// or [Conn.upsertPeerLocked] would see a stale endpoint for the old ID.
++func (m *peerMap) rekeyEndpointLocked(ep *endpoint, oldID tailcfg.NodeID) {
++	if pi, ok := m.byNodeKey[ep.publicKey]; ok {
++		m.byNodeID[ep.nodeID] = pi
+ 	}
++	if was, ok := m.byNodeID[oldID]; ok && was.ep == ep {
++		delete(m.byNodeID, oldID)
++	}
+ }
+ 
+ // deleteEndpoint deletes the peerInfo associated with ep, and
 --- a/wgengine/magicsock/magicsock_test.go
 +++ b/wgengine/magicsock/magicsock_test.go
-@@ -28,6 +28,7 @@
- 	"sync/atomic"
- 	"syscall"
- 	"testing"
-+
- 	"testing/synctest"
- 	"time"
- 	"unsafe"
-@@ -4927,5 +4928,80 @@
+@@ -4927,5 +4927,285 @@
  	}
  	if conn.peerMap.knownPeerDiscoKey(dk1) {
  		t.Error("control key dk1 shoud not be in peermap")
 +	}
 +}
 +
-+// TestTierRoamingLearn 给「收到包即学习/漫游」上锁（本仓 fork 特有，doc: tools/tailcat/PATCHES.md §2.10）：
-+// 出口（SetAcceptProvisionalInitiators 打开）从某个地址收到有效 WG 包，就必须把该地址登记为
-+// 直连候选，并把 best 无条件指向它 —— 无论候选集是否为空、旧 best 是否还在信任窗内。
-+// 没有控制面时「收到包」是直连路径可达的唯一证据：不学，出口就会在旧候选过期后发不出握手
-+// 响应（no candidates available → Failed to send handshake response），隧道"通了"但一切
-+// 自拨出口的能力（文件/终端）都失效。
++// ---------------------------------------------------------------------------
++// tier：直连候选策略回归（本仓补丁特有，文档见 tools/tailcat/PATCHES.md §2.10）
++// ---------------------------------------------------------------------------
++
++// tierTestEndpoint 造一个最小可用的 endpoint，供下面的直连候选策略用例使用。
++func tierTestEndpoint(c *Conn) *endpoint {
++	return &endpoint{
++		c:             c,
++		publicKey:     key.NewNode().Public(),
++		endpointState: map[netip.AddrPort]*endpointState{},
++	}
++}
++
++// TestTierRoamingLearn 给「收到包即学习 + 有条件跟随」上锁（#2）：
++// 没有控制面时「收到包」是直连路径可达的唯一证据 —— 不学，出口的候选会在会话超时后被清空，
++// 握手响应发不出去（`no candidates available` → `Failed to send handshake response`），
++// 隧道"通了"但一切自拨出口的能力（文件、终端）都失效。
++// 但跟随必须是**有条件**的：双端都会把对端的公网地址学成候选，同 LAN 场景下那条路要 NAT
++// 回环才通（家用路由器普遍不回环），无条件跟随会让 best 落在一条发不出去的路径上
++// —— 真机 2026-09-18 08:30 的事故现场（双端 best 都是公网地址，隧道一直挂中继）。
 +func TestTierRoamingLearn(t *testing.T) {
 +	c := &Conn{logf: t.Logf}
 +	c.acceptProvisionalInitiators.Store(true)
-+	de := &endpoint{c: c, endpointState: map[netip.AddrPort]*endpointState{}}
++	de := tierTestEndpoint(c)
 +	now := mono.Now()
 +	src := epAddr{ap: netip.MustParseAddrPort("192.0.2.5:304")}
 +	if !src.isDirect() {
@@ -413,24 +972,59 @@
 +		t.Fatalf("空候选时应学习源地址并设为 best：%v / %v", de.endpointState, de.bestAddr)
 +	}
 +
-+	// 已登记的运行时条目：刷新 lastGotPing（netmap 清理按它判活，不刷新会被误删）
++	// 已登记的运行时条目：刷新 lastGotPing（netmap 清理按它判活，不刷新会被误删）、
++	// 清零发送失败记账（能收到包就是能收）。
 +	old := time.Now().Add(-time.Hour)
 +	de.endpointState[src.ap].lastGotPing = old
++	de.endpointState[src.ap].sendFails = tierSendFailLimit
 +	de.noteRecvActivity(src, now)
 +	if !de.endpointState[src.ap].lastGotPing.After(old) {
 +		t.Fatal("已登记地址应刷新 lastGotPing")
 +	}
++	if de.endpointState[src.ap].sendFails != 0 {
++		t.Fatalf("收到包即证明能收，发送失败记账应清零，got %d", de.endpointState[src.ap].sendFails)
++	}
 +
-+	// 新地址（换网/漫游）：best 必须无条件跟随，哪怕旧 best 还在信任窗内 ——
-+	// 否则握手响应会发给死地址，客户端要等信任窗过期重试才连得上（真机 5s 起步）
-+	other := epAddr{ap: netip.MustParseAddrPort("192.0.2.6:304")}
-+	de.noteRecvActivity(other, now)
-+	if de.bestAddr.epAddr.ap != other.ap {
-+		t.Fatalf("best 应无条件跟随最近收到包的地址：%v", de.bestAddr)
++	// 同类（都是公网）且 best 新鲜：**不**抢 best，避免同一 peer 多路径来回抖。
++	same := epAddr{ap: netip.MustParseAddrPort("192.0.2.6:304")}
++	de.noteRecvActivity(same, mono.Now())
++	if de.bestAddr.epAddr.ap != src.ap {
++		t.Fatalf("同类新鲜候选不应抢 best：best=%v want %v", de.bestAddr.epAddr.ap, src.ap)
++	}
++
++	// 同 LAN 优先（②）：best 是需要 NAT 回环的公网地址时，私网来包地址接管。
++	lan := epAddr{ap: netip.MustParseAddrPort("192.168.3.12:41641")}
++	de.noteRecvActivity(lan, mono.Now())
++	if de.bestAddr.epAddr.ap != lan.ap {
++		t.Fatalf("同 LAN 候选应抢过公网 best：best=%v want %v", de.bestAddr.epAddr.ap, lan.ap)
++	}
++	// 同类（都是私网）不抖。
++	lan2 := epAddr{ap: netip.MustParseAddrPort("192.168.3.99:41641")}
++	de.noteRecvActivity(lan2, mono.Now())
++	if de.bestAddr.epAddr.ap != lan.ap {
++		t.Fatalf("同类私网候选不应抢 best：best=%v want %v", de.bestAddr.epAddr.ap, lan.ap)
++	}
++
++	// ③ best 的候选 2s 没再收到包 → 当前来包地址接管（对端换地址/换网时跟随）。
++	de.endpointState[lan.ap].lastGotPing = time.Now().Add(-3 * time.Second)
++	de.noteRecvActivity(lan2, mono.Now())
++	if de.bestAddr.epAddr.ap != lan2.ap {
++		t.Fatalf("best 陈旧时来包地址应接管：best=%v want %v", de.bestAddr.epAddr.ap, lan2.ap)
++	}
++
++	// ① best 无效 / 信任窗过期 → 无条件采纳（恢复路径，上一版语义）。
++	de.clearBestAddrLocked()
++	de.noteRecvActivity(lan, mono.Now())
++	if de.bestAddr.epAddr.ap != lan.ap {
++		t.Fatalf("best 无效时应采纳来包地址：best=%v want %v", de.bestAddr.epAddr.ap, lan.ap)
++	}
++	de.noteRecvActivity(src, mono.Now().Add(10*time.Second))
++	if de.bestAddr.epAddr.ap == lan.ap {
++		t.Fatalf("信任窗过期后应采纳来包地址：best 仍为 %v", de.bestAddr.epAddr.ap)
 +	}
 +
 +	// netmap 来的条目（lastGotPing 为零）保持为零：它归 netmap 的 index 管理，
-+	// 不能获得运行时语义（否则 peer 安静 45s 就被 sessionActiveTimeout 删掉，尽管还在 netmap 里）
++	// 不能获得运行时语义（否则 peer 安静 45s 就被 sessionActiveTimeout 删掉，尽管还在 netmap 里）。
 +	nmap := epAddr{ap: netip.MustParseAddrPort("192.0.2.7:304")}
 +	de.endpointState[nmap.ap] = &endpointState{}
 +	de.noteRecvActivity(nmap, now)
@@ -438,7 +1032,7 @@
 +		t.Fatal("netmap 来的条目不得获得运行时 lastGotPing")
 +	}
 +
-+	// 非直连源（DERP 伪地址 / 带 VNI 的中继地址）不登记：写进去会把出站流量送去死路径
++	// 非直连源（DERP 伪地址 / 带 VNI 的中继地址）不登记：写进去会把出站流量送去死路径。
 +	derp := epAddr{ap: netip.MustParseAddrPort("127.3.3.40:304")}
 +	if derp.isDirect() {
 +		t.Fatal("前置：DERP 伪地址不应被判为直连")
@@ -448,15 +1042,15 @@
 +		t.Fatal("DERP 地址不得登记为直连候选")
 +	}
 +
-+	// 未开启 AcceptProvisionalInitiators（普通客户端/其它 tailscale.com 使用者）时完全不动
++	// 未开启 AcceptProvisionalInitiators（普通客户端 / 其它 tailscale.com 使用者）时完全不动。
 +	plain := &Conn{logf: t.Logf}
-+	plainEP := &endpoint{c: plain, endpointState: map[netip.AddrPort]*endpointState{}}
++	plainEP := tierTestEndpoint(plain)
 +	plainEP.noteRecvActivity(src, now)
 +	if len(plainEP.endpointState) != 0 || plainEP.bestAddr.ap.IsValid() {
 +		t.Fatalf("未开启时不应学习：%v / %v", plainEP.endpointState, plainEP.bestAddr)
 +	}
 +
-+	// 上限：学到的候选不得超过 tierLearnedEndpointMax（防端口喷洒把候选表撑爆）
++	// 上限：学到的候选不得超过 tierLearnedEndpointMax（防端口喷洒把候选表撑爆）。
 +	base := netip.MustParseAddr("192.0.2.10")
 +	for i := 0; i < tierLearnedEndpointMax; i++ {
 +		de.noteRecvActivity(epAddr{ap: netip.AddrPortFrom(base, uint16(1000+i))}, now)
@@ -465,28 +1059,161 @@
 +	de.noteRecvActivity(capped, now)
 +	if _, ok := de.endpointState[capped.ap]; ok {
 +		t.Fatalf("达到上限 %d 后不得再登记新候选", tierLearnedEndpointMax)
- 	}
- }
---- a/wgengine/magicsock/peermap.go
-+++ b/wgengine/magicsock/peermap.go
-@@ -228,6 +228,20 @@
- 	}
- }
- 
-+// rekeyEndpointLocked moves ep in the byNodeID index from oldID to ep.nodeID.
-+// It is used when an endpoint adopted from a provisional peer (see
-+// [Conn.adoptProvisionalEndpointLocked]) trades its synthetic node ID for the
-+// network map's real one; the two IDs must never both resolve to the same peer,
-+// or [Conn.upsertPeerLocked] would see a stale endpoint for the old ID.
-+func (m *peerMap) rekeyEndpointLocked(ep *endpoint, oldID tailcfg.NodeID) {
-+	if pi, ok := m.byNodeKey[ep.publicKey]; ok {
-+		m.byNodeID[ep.nodeID] = pi
-+	}
-+	if was, ok := m.byNodeID[oldID]; ok && was.ep == ep {
-+		delete(m.byNodeID, oldID)
 +	}
 +}
 +
- // deleteEndpoint deletes the peerInfo associated with ep, and
- // updates indexes.
- func (m *peerMap) deleteEndpoint(ep *endpoint) {
++// TestTierNoteDirectCandidatePrefersLAN（#2 ②）：best 是公网（需 NAT 回环）时被私网来包地址抢过。
++func TestTierNoteDirectCandidatePrefersLAN(t *testing.T) {
++	c := newConn(t.Logf)
++	ep := tierTestEndpoint(c)
++	public := netip.MustParseAddrPort("114.242.60.128:41641")
++	lan := netip.MustParseAddrPort("192.168.3.12:41641")
++	now := mono.Now()
++
++	ep.noteDirectCandidate(epAddr{ap: public}, now)
++	if got := ep.bestAddr.ap; got != public {
++		t.Fatalf("first candidate should be adopted, got %v", got)
++	}
++	ep.noteDirectCandidate(epAddr{ap: lan}, now)
++	if got := ep.bestAddr.ap; got != lan {
++		t.Fatalf("same-LAN candidate should take over from public, got %v", got)
+ 	}
++	// 同类（都是私网）不抖：再来一个私网地址不抢。
++	lan2 := netip.MustParseAddrPort("192.168.3.99:41641")
++	ep.noteDirectCandidate(epAddr{ap: lan2}, now)
++	if got := ep.bestAddr.ap; got != lan {
++		t.Fatalf("same-class candidate must not flap, got %v", got)
++	}
++	// best 过期后无条件采纳（恢复路径）。
++	ep.noteDirectCandidate(epAddr{ap: lan2}, mono.Now().Add(10*time.Second))
++	if got := ep.bestAddr.ap; got != lan2 {
++		t.Fatalf("expired best should be replaced, got %v", got)
++	}
+ }
++
++// TestTierNoteDirectCandidateStaleBest（#2 ③）：best 的候选 2s 没再收到包 → 切到刚收到包的地址。
++func TestTierNoteDirectCandidateStaleBest(t *testing.T) {
++	c := newConn(t.Logf)
++	ep := tierTestEndpoint(c)
++	a := netip.MustParseAddrPort("100.64.0.9:1234")
++	b := netip.MustParseAddrPort("100.64.0.10:1234")
++	now := mono.Now()
++	ep.noteDirectCandidate(epAddr{ap: a}, now)
++	ep.endpointState[a].lastGotPing = time.Now().Add(-5 * time.Second)
++	ep.noteDirectCandidate(epAddr{ap: b}, now)
++	if got := ep.bestAddr.ap; got != b {
++		t.Fatalf("stale best should be replaced, got %v", got)
++	}
++}
++
++// TestTierSendFailureDropsRuntimeCandidate（#3）：连续发送失败到阈值 → 运行时学来的候选被摘除、best 清空。
++func TestTierSendFailureDropsRuntimeCandidate(t *testing.T) {
++	c := newConn(t.Logf)
++	ep := tierTestEndpoint(c)
++	pub := netip.MustParseAddrPort("114.242.60.128:41641")
++	live := netip.MustParseAddrPort("192.168.3.56:52085")
++	now := mono.Now()
++	ep.noteDirectCandidate(epAddr{ap: pub}, now)
++	ep.noteDirectCandidate(epAddr{ap: live}, now) // 同 LAN 优先：抢过公网 best
++	if ep.bestAddr.ap != live {
++		t.Fatalf("best = %v, want %v", ep.bestAddr.ap, live)
++	}
++	for i := 0; i < tierSendFailLimit; i++ {
++		ep.noteSendFailure(live)
++	}
++	if _, ok := ep.endpointState[live]; ok {
++		t.Fatalf("runtime-learned candidate must be dropped after %d send failures", tierSendFailLimit)
++	}
++	if ep.bestAddr.ap.IsValid() {
++		t.Fatalf("bestAddr must be cleared, got %v", ep.bestAddr.ap)
++	}
++	if _, ok := ep.endpointState[pub]; !ok {
++		t.Fatalf("other candidates must survive")
++	}
++}
++
++// TestTierSendFailureBacksOffNetmapCandidate（#3）：网络地图候选摘不掉 → 进入探测退避。
++func TestTierSendFailureBacksOffNetmapCandidate(t *testing.T) {
++	c := newConn(t.Logf)
++	ep := tierTestEndpoint(c)
++	nmAddr := netip.MustParseAddrPort("203.0.113.9:41641")
++	ep.endpointState[nmAddr] = &endpointState{} // lastGotPing 为零 = 来自网络地图
++	for i := 0; i < tierSendFailLimit; i++ {
++		ep.noteSendFailure(nmAddr)
++	}
++	st, ok := ep.endpointState[nmAddr]
++	if !ok {
++		t.Fatalf("network-map candidate must not be dropped")
++	}
++	if got := st.pingInterval(); got != tierSendFailBackoff {
++		t.Fatalf("ping interval = %v, want %v", got, tierSendFailBackoff)
++	}
++	// 收到它的包 → 记账清零、探测回到常规节奏。
++	ep.noteDirectCandidate(epAddr{ap: nmAddr}, mono.Now())
++	if st.sendFails != 0 {
++		t.Fatalf("send failures must reset on receive, got %d", st.sendFails)
++	}
++	if got := st.pingInterval(); got != discoPingInterval {
++		t.Fatalf("ping interval after success = %v, want %v", got, discoPingInterval)
++	}
++}
++
++// TestTierBootstrapLogThrottle（#6）：同址 5s 内只打一条，抑制计数附在下一条上。
++func TestTierBootstrapLogThrottle(t *testing.T) {
++	var lines []string
++	c := newConn(func(format string, args ...any) { lines = append(lines, format) })
++	ep := tierTestEndpoint(c)
++	ap := netip.MustParseAddrPort("192.168.3.12:41641")
++	for i := 0; i < 100; i++ {
++		ep.logBootstrapSendLocked(ap, true, 11)
++	}
++	if len(lines) != 1 {
++		t.Fatalf("expected 1 line, got %d", len(lines))
++	}
++	if ep.bootstrapLogSuppressed != 99 {
++		t.Fatalf("suppressed = %d, want 99", ep.bootstrapLogSuppressed)
++	}
++	other := netip.MustParseAddrPort("192.168.3.13:41641")
++	ep.logBootstrapSendLocked(other, false, 11)
++	if len(lines) != 2 {
++		t.Fatalf("address change must log immediately, got %d lines", len(lines))
++	}
++	if ep.bootstrapLogSuppressed != 0 {
++		t.Fatalf("suppressed counter must reset after printing, got %d", ep.bootstrapLogSuppressed)
++	}
++}
++
++// TestTierDerpPeerGone（#8）：PeerGone 摘掉 DERP 回退地址；TTL 到点或收到 DERP 包后恢复。
++func TestTierDerpPeerGone(t *testing.T) {
++	c := newConn(t.Logf)
++	ep := tierTestEndpoint(c)
++	home := netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, 304)
++	ep.derpAddr = home
++	ep.noteDerpRouteGone(304)
++	if ep.derpAddr.IsValid() {
++		t.Fatalf("derpAddr must be cleared on PeerGone")
++	}
++	// 别的区域说不认识 → 不动（不是它的家）。
++	ep.derpAddr = home
++	ep.noteDerpRouteGone(305)
++	if !ep.derpAddr.IsValid() {
++		t.Fatalf("PeerGone from another region must not clear the home fallback")
++	}
++	// TTL 未到不恢复，到点恢复一次。
++	ep.noteDerpRouteGone(304)
++	ep.maybeRestoreDerpAddrLocked()
++	if ep.derpAddr.IsValid() {
++		t.Fatalf("must not restore before the retry interval")
++	}
++	ep.derpGoneAt = time.Now().Add(-2 * tierDerpRetryAfter)
++	ep.maybeRestoreDerpAddrLocked()
++	if ep.derpAddr != home {
++		t.Fatalf("derpAddr = %v, want %v", ep.derpAddr, home)
++	}
++	// 收到对端经 DERP 发来的包 → 立即恢复。
++	ep.noteDerpRouteGone(304)
++	ep.noteDerpRouteBack(304)
++	if ep.derpAddr != home {
++		t.Fatalf("derpAddr = %v, want %v via noteDerpRouteBack", ep.derpAddr, home)
++	}
++}

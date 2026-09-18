@@ -61,8 +61,14 @@ jobs:
           go mod download tailscale.com
           ./tools/apply-modcache-patches.sh
           MOD="$(go env GOMODCACHE)/tailscale.com@$(sed -n 's/^[[:space:]]*tailscale\.com \(v[^[:space:]]*\).*/\1/p' go.mod | head -1)"
-          grep -q 'PATCH(tier)' "$MOD/wgengine/magicsock/endpoint.go"
+          # ⚠️ 判据用**最新一版**补丁才有的 marker（tierNoHairpinAddr = 2026-09-18 的候选策略/
+          # 日志节流/DERP 回退修复）。拿老 marker 判会让「cache 里是旧一版补丁」静默通过 ——
+          # 旧补丁照样编得过、冒烟也照样绿，少掉的那批修复无声无息。
+          grep -q 'tierNoHairpinAddr' "$MOD/wgengine/magicsock/endpoint.go"
           grep -q 'PATCH(tier)' "$MOD/wgengine/magicsock/magicsock.go"
+          grep -q 'PATCH(tier #8)' "$MOD/wgengine/magicsock/derp.go"
+          grep -q 'rekeyEndpointLocked' "$MOD/wgengine/magicsock/peermap.go"
+          grep -q 'TestTierRoamingLearn' "$MOD/wgengine/magicsock/magicsock_test.go"
           echo "modcache patch verified in $MOD"
 
       # Same recipe as the release build (.goreleaser.yaml): CGO off,

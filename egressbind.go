@@ -45,26 +45,9 @@ const (
 	failsBeforeReval = 2                // 当前绑定连续几轮复核失败才触发重评估
 )
 
-// virtualIfPrefixes 是候选黑名单——只是省时降噪，终审权在探针（漏网的多余网卡探不通自然出局）。
-var virtualIfPrefixes = []string{
-	"lo", "utun", "tun", "tap", "wg", "tailscale", "awdl", "llw", "anpi",
-	"bridge", "vmenet", "docker", "virbr", "veth", "br-", "ap",
-}
-
-// IsVirtualInterface reports whether name looks like a virtual interface
-// (loopback/tun/bridge/docker/…), per the egressbind candidate blacklist.
-// Exported for the endpoint-hint LAN collector, which must skip virtual
-// interfaces so container bridges don't leak into addresses as LAN hints.
-func IsVirtualInterface(name string) bool { return isVirtualInterface(name) }
-
-func isVirtualInterface(name string) bool {
-	for _, p := range virtualIfPrefixes {
-		if strings.HasPrefix(name, p) {
-			return true
-		}
-	}
-	return false
-}
+// 候选网卡的黑名单（virtualIfPrefixes / isVirtualInterface / IsVirtualInterface）
+// 已移到共享的 localaddr.go：直连候选通告的过滤（onEngineStatus）与出口的物理上行
+// 绑定用同一份判据，分居两处会漂。
 
 // enumerateCandidates 返回候选物理网卡名（up + 有 IPv4 地址 + 不在黑名单）。纯函数，单测覆盖。
 func enumerateCandidates(ifaces []net.Interface) []string {
