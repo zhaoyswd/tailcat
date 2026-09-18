@@ -12,12 +12,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -93,15 +96,178 @@ func termConfigFromEnv() termConfig {
 	return cfg
 }
 
-// defaultShell 返回登录 shell（TAILCAT_TERM_SHELL > $SHELL > /bin/sh）。
-func defaultShell() string {
-	if s := strings.TrimSpace(os.Getenv("TAILCAT_TERM_SHELL")); s != "" {
+// ---- 登录 shell 与登录环境：与「用户自己开一个终端」对齐 ----
+//
+// 出口进程常由 launchd / systemd / docker 拉起，继承的是**服务环境**：里面有
+// XPC_SERVICE_NAME、OSLogRateLimit 这类只在服务上下文里成立的变量，$SHELL 也可能缺失
+//（真机实测：LaunchAgent 拉起的出口，会话里带 XPC_SERVICE_NAME=me.zhaozhe.tailcat-exit、
+// 没有 TERM_PROGRAM，而 SHELL 一旦缺失就会掉到 /bin/sh）。原样交给 PTY 里的 shell，
+// 用户拿到的就是一个「像服务、不像终端」的环境。所以这里对齐三件事：
+//
+//  1. 选**账号数据库里的登录 shell**（macOS dscl / 其它 unix /etc/passwd），
+//     逐级回退 $SHELL → 平台默认；候选项都要求可执行。
+//  2. 只把「用户身份 + 临时目录 + 语言 + agent socket」白名单变量交给子进程，
+//     服务变量一律不带（XPC_*/OSLogRateLimit/__CF*…）。
+//  3. 终端标记（TERM/COLORTERM/TERM_PROGRAM[/_VERSION]/TERM_SESSION_ID）由我们写，
+//     让会话里跑的工具知道自己在一个名为 Tailcat 的终端里（TERM_PROGRAM 是 Terminal/iTerm/vscode 的惯例）。
+//
+// 之后一律以**登录 shell** 起（默认 `shell -l`；命令模式 `shell -lc '<命令>'`）：
+// PATH、brew、pnpm 等由用户自己的 /etc/zprofile → ~/.zprofile → ~/.zshrc 决定 ——
+// 和用户直接开终端走同一条路径，用户改 rc 之后下一个会话即生效。
+
+// termPlatformShells 平台默认 shell 候选（账号数据库与 $SHELL 都拿不到时的最后回退）。
+func termPlatformShells() []string {
+	if runtime.GOOS == "darwin" {
+		return []string{"/bin/zsh", "/bin/bash", "/bin/sh"}
+	}
+	return []string{"/bin/bash", "/bin/sh"}
+}
+
+// termAccountShell 从账号数据库取该用户的登录 shell（取不到返回空串）。
+func termAccountShell() string {
+	name := strings.TrimSpace(os.Getenv("USER"))
+	if name == "" {
+		name = strings.TrimSpace(os.Getenv("LOGNAME"))
+	}
+	if name == "" {
+		if u, err := user.Current(); err == nil {
+			name = u.Username
+		}
+	}
+	if name == "" {
+		return ""
+	}
+	if runtime.GOOS == "darwin" {
+		// macOS 本地账号在 Open Directory 里，/etc/passwd 通常查不到（本机实测：
+		// `grep zhaozhe /etc/passwd` 无输出，必须问 dscl）。
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, "/usr/bin/dscl", ".", "-read", "/Users/"+name, "UserShell").Output()
+		if err != nil {
+			return ""
+		}
+		s := strings.TrimSpace(string(out))
+		if i := strings.LastIndex(s, ":"); i >= 0 {
+			s = strings.TrimSpace(s[i+1:])
+		}
 		return s
 	}
-	if s := strings.TrimSpace(os.Getenv("SHELL")); s != "" {
-		return s
+	raw, err := os.ReadFile("/etc/passwd")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		f := strings.Split(line, ":")
+		if len(f) >= 7 && f[0] == name {
+			return strings.TrimSpace(f[6])
+		}
+	}
+	return ""
+}
+
+// termExecutable 判定候选 shell 是否真的可执行（不存在/目录/无 x 位都不行）。
+func termExecutable(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir() && st.Mode()&0o111 != 0
+}
+
+// pickShell 取第一个可执行的候选；全不可执行时返回首个非空候选
+// （宁可让 spawn 明确失败，也不静默换一个用户没选的 shell）。
+func pickShell(cands ...string) string {
+	first := ""
+	for _, c := range cands {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		if first == "" {
+			first = c
+		}
+		if termExecutable(c) {
+			return c
+		}
+	}
+	if first != "" {
+		return first
 	}
 	return "/bin/sh"
+}
+
+// loginShell 解析顺序：账号数据库 > $SHELL（服务环境）> 平台默认。
+func loginShell() string {
+	return pickShell(append([]string{termAccountShell(), strings.TrimSpace(os.Getenv("SHELL"))},
+		termPlatformShells()...)...)
+}
+
+// termEnvKeep 从服务环境里**白名单**保留的变量：身份、家目录、临时目录、语言、PATH。
+// SSH_AUTH_SOCK 保留是有意的：macOS 的 Terminal 会话同样带一个 launchd 的 per-user
+// listener socket，留着 ssh-agent 转发才继续可用。
+var termEnvKeep = []string{
+	"HOME", "USER", "LOGNAME", "TMPDIR", "SSH_AUTH_SOCK", "PATH",
+	"LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+}
+
+func termEnvKept(k string) bool {
+	for _, want := range termEnvKeep {
+		if k == want {
+			return true
+		}
+	}
+	return false
+}
+
+// termDefaultPATH 服务环境里没有 PATH 时的平台默认值。
+func termDefaultPATH() string {
+	if runtime.GOOS == "darwin" {
+		return "/usr/bin:/bin:/usr/sbin:/sbin"
+	}
+	return "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+}
+
+// termEnvLookup 在 []string 形态的环境里取值（取不到返回空串）。
+func termEnvLookup(env []string, key string) string {
+	for _, kv := range env {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == key {
+			return v
+		}
+	}
+	return ""
+}
+
+// termLoginEnv 构造 PTY 子进程环境：白名单 + 强制终端标记（详见本节开头）。
+func termLoginEnv(shell, sessionID string) []string {
+	env := make([]string, 0, len(termEnvKeep)+8)
+	havePATH, haveHOME := false, false
+	for _, kv := range os.Environ() {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || v == "" || !termEnvKept(k) {
+			continue
+		}
+		switch k {
+		case "PATH":
+			havePATH = true
+		case "HOME":
+			haveHOME = true
+		}
+		env = append(env, kv)
+	}
+	if !haveHOME {
+		if u, err := user.Current(); err == nil && u.HomeDir != "" {
+			env = append(env, "HOME="+u.HomeDir)
+		}
+	}
+	if !havePATH {
+		env = append(env, "PATH="+termDefaultPATH())
+	}
+	env = append(env,
+		"SHELL="+shell, // 解析出的登录 shell，覆盖服务环境里的值
+		"TERM=xterm-256color",
+		"COLORTERM=truecolor",
+		"TERM_PROGRAM=Tailcat",
+		"TERM_PROGRAM_VERSION="+forkBuildTag(),
+		"TERM_SESSION_ID="+sessionID,
+	)
+	return env
 }
 
 type termService struct {
@@ -126,7 +292,7 @@ func newTermService(logf logger.Logf) *termService {
 }
 
 func (s *termService) Port() uint16      { return s.cfg.port }
-func (s *termService) ShellText() string { return defaultShell() }
+func (s *termService) ShellText() string { return loginShell() }
 
 func (s *termService) HistoryText() string {
 	return fmt.Sprintf("%dKiB", s.cfg.history>>10)
@@ -643,18 +809,24 @@ func (s *termService) attachOrCreate(name string, cols, rows uint16, create bool
 }
 
 // spawnLocked 起一个 PTY 会话（调用方持 s.mu）。
+//
+// 两种模式都走**登录 shell + 环境白名单**（见「登录 shell 与登录环境」一节）：
+//   - 默认：`shell -l`（交互式登录 shell，rc 文件决定 PATH 等）
+//   - TAILCAT_TERM_SHELL：`shell -lc '<命令>'`（例如 tmux；profile 里的 PATH 同样生效，
+//     所以 homebrew 装的 tmux 在 macOS 上也找得到）
 func (s *termService) spawnLocked(name string, cols, rows uint16) (*termSession, error) {
-	shell := defaultShell()
+	shell := loginShell()
 	var cmd *exec.Cmd
 	if s.cfg.shell != "" {
 		// TAILCAT_TERM_SHELL：一条命令（例如 tmux new -A -s tier / screen -dR）。
-		cmd = exec.Command("/bin/sh", "-c", s.cfg.shell)
+		// ⚠️ 不要退回硬编码的 /bin/sh：distroless 之类没有 /bin/sh 的镜像里那条逃生口会直接死。
+		cmd = exec.Command(shell, "-lc", s.cfg.shell)
 	} else {
 		cmd = exec.Command(shell, "-l")
 	}
-	env := append(os.Environ(), "TERM=xterm-256color", "COLORTERM=truecolor")
+	env := termLoginEnv(shell, "tailcat-"+name)
 	cmd.Env = env
-	if home := strings.TrimSpace(os.Getenv("HOME")); home != "" {
+	if home := termEnvLookup(env, "HOME"); home != "" {
 		cmd.Dir = home
 	}
 	if cols == 0 {

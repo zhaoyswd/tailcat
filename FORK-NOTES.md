@@ -297,6 +297,31 @@ grep "advertise: 跳过" ~/tailcat-exit/exit.log | tail -3
 tier 仓库 `tools/tailcat/PATCHES.md` §#10.5。CI 的补丁校验 marker 已换成 `tierNoHairpinAddr`
 （老 marker 会让「cache 里是旧一版补丁」静默通过）。
 
+### 10. 终端服务：`exit-node` 自带一个「出口上的登录 shell」（v0.6.0-udp.18 起；执行环境对齐 2026-09-18）
+
+只要服务里有 `exit-node`，这份构建就自动在**隧道内虚拟端口 7724** 上提供终端会话（不占物理端口、
+不需要在出口装 sshd/tmux、零 CLI 旗标；`TAILCAT_TERM=off` 可整体关掉）。会话由出口持有：客户端断开
+不杀进程，重进先回放有界历史；`TAILCAT_TERM_SHELL` / `TAILCAT_TERM_HISTORY` 等环境变量调参
+（见 tier 仓库 `docs/EXIT-NODE-SETUP.md` 的「终端服务」一节）。
+
+**执行环境 = 主机默认登录环境**（2026-09-18 对齐。起因：launchd 拉起的出口把**服务环境**原样漏进了
+用户 shell —— 会话里带 `XPC_SERVICE_NAME=…`、没有 `TERM_PROGRAM`、`PATH` 也是服务的最小值）：
+
+- **登录 shell** 解析顺序 = 账号数据库（macOS `dscl` / 其它 unix `/etc/passwd`）→ `$SHELL` → 平台默认
+  （darwin `/bin/zsh`→`/bin/bash`→`/bin/sh`；linux `/bin/bash`→`/bin/sh`），候选都要求真的可执行。
+- 一律以**登录 shell** 起：默认 `shell -l`（交互式登录 shell ⇒ `/etc/zprofile` → `~/.zprofile` → `~/.zshrc`
+  决定 PATH/brew/pnpm 等，用户改 rc 下个会话即生效）；`TAILCAT_TERM_SHELL='tmux new -A -s tier'`
+  走 `shell -lc`，**不再硬编码 `/bin/sh`** —— distroless 之类没有 `/bin/sh` 的镜像里，硬编码会让这条
+  逃生口直接死。
+- 子进程环境是**白名单**：`HOME/USER/LOGNAME/TMPDIR/SSH_AUTH_SOCK/PATH/LANG/LC_*` 保留，再写死终端标记
+  `TERM=xterm-256color`、`COLORTERM=truecolor`、`TERM_PROGRAM=Tailcat`、`TERM_PROGRAM_VERSION=<构建号>`、
+  `TERM_SESSION_ID=tailcat-<会话名>`；服务变量（`XPC_*`、`OSLogRateLimit`、`__CF*`…）不再泄漏。
+- 真机判据：会话里 `echo $TERM_PROGRAM $SHELL` → `Tailcat /bin/zsh`，`PATH` 含 `/opt/homebrew/bin`
+  （回归测试 `TestTermLoginEnvWhitelist` / `TestTermSessionSpawnEnvAligned` / `TestTermPickShell`）。
+- ⚠️ **distroless/scratch 镜像里没有 shell**：终端服务照样注册，但新会话必然 `spawn_failed`。
+  这类出口（官方 Dockerfile 的 `FROM gcr.io/distroless/static`）应设 **`TAILCAT_TERM=off`**，
+  否则客户端只会看到「出口无法提供 shell」。
+
 ## 兼容性与混用
 
 - **CLI 参数、地址格式、线协议**与官方 v0.6.0 完全兼容；新增参数都有默认值。

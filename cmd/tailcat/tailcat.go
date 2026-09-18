@@ -439,7 +439,7 @@ to the same port on localhost. Service names are:
 	all          serve all ports
 	exit-node    run an exit node for all addresses
 	             (also provides the terminal service on virtual
-	             port 7724 in this fork; see FORK-NOTES section 9)
+	             port 7724 in this fork; see FORK-NOTES section 10)
 	term         accepted as a readable alias: the terminal service
 	             comes with exit-node, so this only makes the service
 	             list self-documenting

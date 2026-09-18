@@ -10,6 +10,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -22,7 +24,14 @@ const testTermShell = "while :; do echo tick; sleep 0.2; done & cat"
 
 func startTestTermService(t *testing.T) (*termService, net.Listener) {
 	t.Helper()
-	t.Setenv("TAILCAT_TERM_SHELL", testTermShell)
+	return startTestTermServiceShell(t, testTermShell)
+}
+
+// startTestTermServiceShell 同 startTestTermService，但指定 TAILCAT_TERM_SHELL
+// （"" = 走登录 shell 模式，和线上默认路径一致）。
+func startTestTermServiceShell(t *testing.T, shellCmd string) (*termService, net.Listener) {
+	t.Helper()
+	t.Setenv("TAILCAT_TERM_SHELL", shellCmd)
 	t.Setenv("TAILCAT_TERM_HISTORY", "65536")
 	t.Setenv("TAILCAT_TERM_REPLAY", "32768")
 	t.Setenv("TAILCAT_TERM_DETECT", "off")
@@ -312,5 +321,118 @@ func TestTermServiceErrors(t *testing.T) {
 	writeTermFrame(t, c3, opKill, encName("nope"))
 	if f := readTermFrameT(t, c3); f.op != opError {
 		t.Fatalf("kill 不存在的会话应回 ERROR，收到 0x%02x", f.op)
+	}
+}
+
+// ---- 登录 shell 与登录环境（与「用户自己开一个终端」对齐）----
+
+// pickShell 的判据：跳过不可执行的候选；全不可执行时返回首个非空候选。
+func TestTermPickShell(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good-shell")
+	if err := os.WriteFile(good, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	notExec := filepath.Join(dir, "not-exec")
+	if err := os.WriteFile(notExec, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := pickShell(notExec, good, "/bin/sh"); got != good {
+		t.Errorf("不可执行候选应被跳过：期望 %s，得到 %s", good, got)
+	}
+	if got := pickShell("", "   ", good); got != good {
+		t.Errorf("空候选应被跳过：期望 %s，得到 %s", good, got)
+	}
+	// 全不可执行：宁可让 spawn 明确失败，也不静默换一个用户没选的 shell
+	if got := pickShell(notExec, filepath.Join(dir, "missing")); got != notExec {
+		t.Errorf("全不可执行时应返回首个非空候选：期望 %s，得到 %s", notExec, got)
+	}
+	if got := pickShell("", ""); got != "/bin/sh" {
+		t.Errorf("无候选时应回退 /bin/sh，得到 %s", got)
+	}
+}
+
+// loginShell 必须真的取到账号数据库里的登录 shell（对齐的根判据）。
+func TestTermLoginShellFromAccount(t *testing.T) {
+	got := loginShell()
+	if got == "" {
+		t.Fatal("loginShell() 返回空")
+	}
+	if !termExecutable(got) {
+		t.Fatalf("loginShell() 返回了不可执行的路径：%s", got)
+	}
+	if want := termAccountShell(); want != "" && got != want {
+		t.Errorf("账号登录 shell 应为 %s，得到 %s", want, got)
+	}
+}
+
+// 环境白名单：服务变量不泄漏；身份/语言/agent socket 保留；终端标记由我们写死。
+func TestTermLoginEnvWhitelist(t *testing.T) {
+	t.Setenv("XPC_SERVICE_NAME", "me.zhaozhe.tailcat-exit")
+	t.Setenv("XPC_FLAGS", "1")
+	t.Setenv("OSLogRateLimit", "64")
+	t.Setenv("TAILCAT_TERM_DUMMY", "leak")
+	t.Setenv("SHELL", "/bin/false") // 服务环境的 $SHELL 不得直接进会话
+	t.Setenv("LANG", "zh_CN.UTF-8")
+	t.Setenv("SSH_AUTH_SOCK", "/var/run/agent.sock")
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	env := termLoginEnv("/bin/zsh", "tailcat-s1")
+	got := func(k string) string { return termEnvLookup(env, k) }
+
+	for _, k := range []string{"XPC_SERVICE_NAME", "XPC_FLAGS", "OSLogRateLimit", "TAILCAT_TERM_DUMMY"} {
+		if v := got(k); v != "" {
+			t.Errorf("服务环境变量 %s=%q 泄漏进会话环境", k, v)
+		}
+	}
+	for k, want := range map[string]string{
+		"SHELL":           "/bin/zsh",
+		"TERM":            "xterm-256color",
+		"COLORTERM":       "truecolor",
+		"TERM_PROGRAM":    "Tailcat",
+		"TERM_SESSION_ID": "tailcat-s1",
+		"LANG":            "zh_CN.UTF-8",
+		"SSH_AUTH_SOCK":   "/var/run/agent.sock",
+		"PATH":            "/usr/bin:/bin",
+	} {
+		if v := got(k); v != want {
+			t.Errorf("%s：期望 %q，得到 %q", k, want, v)
+		}
+	}
+	if got("TERM_PROGRAM_VERSION") == "" {
+		t.Error("TERM_PROGRAM_VERSION 不应为空")
+	}
+	if got("HOME") == "" {
+		t.Error("HOME 不应为空（服务环境没有时应从账号数据库补）")
+	}
+}
+
+// 端到端判据：真起一个 PTY 会话（命令模式跑 env），会话里必须
+// ① 有终端标记与登录 shell 变量；② 没有服务变量；③ SHELL 就是账号登录 shell。
+func TestTermSessionSpawnEnvAligned(t *testing.T) {
+	t.Setenv("XPC_SERVICE_NAME", "me.zhaozhe.tailcat-exit")
+	t.Setenv("OSLogRateLimit", "64")
+	svc, ln := startTestTermServiceShell(t, "env")
+	defer ln.Close()
+	defer svc.Close()
+
+	c, _, replay, _ := attachTerm(t, ln, "env-aligned", true, 80, 24)
+	defer c.Close()
+	data, _ := collectUntil(t, c, opEnded)
+	out := string(replay) + string(data)
+
+	for _, want := range []string{"TERM_PROGRAM=Tailcat", "TERM=xterm-256color", "SHELL=", "PATH="} {
+		if !strings.Contains(out, want) {
+			t.Errorf("会话环境缺少 %s；实际输出：\n%s", want, out)
+		}
+	}
+	for _, bad := range []string{"XPC_SERVICE_NAME", "OSLogRateLimit"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("服务环境变量 %s 泄漏进了会话：\n%s", bad, out)
+		}
+	}
+	if want := loginShell(); !strings.Contains(out, "SHELL="+want) {
+		t.Errorf("SHELL 应为账号登录 shell %s；实际输出：\n%s", want, out)
 	}
 }
