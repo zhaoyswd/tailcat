@@ -487,6 +487,13 @@ type lazyPeerEntry struct {
 // peerConfig); stale entries from one-shot forged initiations age out.
 const lazyPeerTTL = 24 * time.Hour
 
+// lazyPeerMax caps the lazy-peer index. Insertion requires only our public
+// key (anyone holding a token can craft initiations), so within the TTL
+// window the map would otherwise grow without bound; the cap evicts the
+// oldest entry instead. Sized to match magicsock's provisional endpoint
+// cap (provisionalEndpointMax=32) — far above any real client count.
+const lazyPeerMax = 32
+
 func (b *locoBackend) derpRegionID() tailcfg.DERPRegionID {
 	if b.dm == nil {
 		panic("no derp map")
@@ -1649,8 +1656,9 @@ func (b *locoBackend) peerConfig(k key.NodePublic) (_ wgcfg.PeerConfig, ok bool)
 
 // noteLazyPeer records k in the lazy-peer index for return-path routing
 // before the meow registration lands. Insertion opportunistically evicts
-// entries older than lazyPeerTTL; the eviction sweep is cheap because it
-// only runs when a new peer handshake arrives.
+// entries older than lazyPeerTTL and, if still at lazyPeerMax, the oldest
+// entry; both sweeps are cheap because they only run when a new peer
+// handshake arrives.
 func (b *locoBackend) noteLazyPeer(k key.NodePublic) {
 	addr := tcAddrForKey(k)
 	b.lazyMu.Lock()
@@ -1662,6 +1670,21 @@ func (b *locoBackend) noteLazyPeer(k key.NodePublic) {
 	for a, e := range b.lazyPeers {
 		if now.Sub(e.at) > lazyPeerTTL {
 			delete(b.lazyPeers, a)
+		}
+	}
+	if len(b.lazyPeers) >= lazyPeerMax {
+		// 逐出最旧条目。哨兵不能用 netip.Addr{}.IsUnspecified()：零值 Addr 是
+		// invalid、IsUnspecified 对它返回 false，首个候选会选不中。
+		var oldest netip.Addr
+		var oldestAt time.Time
+		found := false
+		for a, e := range b.lazyPeers {
+			if !found || e.at.Before(oldestAt) {
+				oldest, oldestAt, found = a, e.at, true
+			}
+		}
+		if found {
+			delete(b.lazyPeers, oldest)
 		}
 	}
 	b.lazyPeers[addr] = lazyPeerEntry{key: k, at: now}
