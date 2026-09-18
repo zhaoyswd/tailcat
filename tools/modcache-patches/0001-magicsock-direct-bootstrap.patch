@@ -580,26 +580,30 @@
  			c.logf("magicsock: %s", errGSO.Error())
  			err = errGSO.RetryErr
  		} else {
-@@ -2037,6 +2060,18 @@
- 	} else {
+@@ -2038,6 +2061,22 @@
  		if !c.networkDown() && pmtuShouldLogDiscoTxErr(m, err) {
  			c.logf("magicsock: disco: failed to send %v to %v %s: %v", disco.MessageSummary(m), dst, dstKey.ShortString(), err)
-+		}
+ 		}
 +		// PATCH(tier #3): 直连候选的发送失败要记账（否则一条死地址会被每 5s
-+		// 白 ping 一次、还可能是 bestAddr）；DERP 目标与 MTU 探测错误不计。
++		// 白 ping 一次、还可能是 bestAddr）；DERP 目标与 PMTU 探测错误不计。
++		// 「是不是 PMTU 探测错误」借用上游自己的判据 pmtuShouldLogDiscoTxErr：它按
++		// disco.Ping.Padding + EMSGSIZE 判定，而且**每个平台都定义**（unix 在 peermtu.go、
++		// 其余平台在 peermtu_stubs.go）——直接引 errEMSGSIZE 会让 Windows 编不过
++		//（那个变量只在 unix 版 peermtu.go 里；v0.6.0-udp.20 的 CI 就是这么红的）。
 +		// 注意锁序：先取 c.mu 拿 endpoint 指针（peerMap 由 c.mu 守护），释放后再取
 +		// de.mu —— sendDiscoMessage 的调用方都不持有这两把锁。
-+		if !isDERP && !errors.Is(err, errEMSGSIZE) {
++		if !isDERP && pmtuShouldLogDiscoTxErr(m, err) {
 +			c.mu.Lock()
 +			ep, ok := c.peerMap.endpointForEpAddr(dst)
 +			c.mu.Unlock()
 +			if ok {
 +				ep.noteSendFailure(dst.ap)
 +			}
- 		}
++		}
  	}
  	return sent, err
-@@ -2815,6 +2850,184 @@
+ }
+@@ -2815,6 +2854,184 @@
  	c.peerMap.forEachEndpoint(func(ep *endpoint) {
  		ep.setHeartbeatDisabled(v)
  	})
@@ -784,7 +788,7 @@
  }
  
  // SilentDisco returns true if silent disco is enabled, otherwise false.
-@@ -3135,7 +3348,11 @@
+@@ -3135,7 +3352,11 @@
  			keep.Add(n.Key())
  		}
  		c.peerMap.forEachEndpoint(func(ep *endpoint) {
@@ -797,10 +801,11 @@
  				c.peerMap.deleteEndpoint(ep)
  			}
  		})
-@@ -3172,6 +3389,18 @@
+@@ -3171,6 +3392,18 @@
+ 		// it anew.
  		c.peerMap.deleteEndpoint(ep)
  		ok = false
- 	}
++	}
 +	if !ok {
 +		// PATCH(tier): the network map is the authoritative version of a peer
 +		// we already learned from a direct handshake. Adopt that endpoint in
@@ -812,11 +817,10 @@
 +			c.adoptProvisionalEndpointLocked(pep, n)
 +			ep, ok = pep, true
 +		}
-+	}
+ 	}
  	if ok {
  		// At this point we're modifying an existing endpoint (ep) whose
- 		// public key and nodeID match n. Its other fields (such as disco
-@@ -3199,7 +3428,6 @@
+@@ -3199,7 +3432,6 @@
  		c.peerMap.upsertEndpoint(ep, oldDiscoKey, false)
  		return
  	}
@@ -824,7 +828,7 @@
  	if ep, ok := c.peerMap.endpointForNodeKey(n.Key()); ok {
  		// At this point n.Key() should be for a key we've never seen before. If
  		// ok was true above, it was an update to an existing matching key and
-@@ -4394,6 +4622,15 @@
+@@ -4394,6 +4626,15 @@
  	}
  	le.c.mu.Lock()
  	ep, ok := le.c.peerMap.endpointForNodeKey(pubKey)
@@ -840,7 +844,7 @@
  	le.c.mu.Unlock()
  	if !ok {
  		return
-@@ -4587,3 +4824,26 @@
+@@ -4587,3 +4828,26 @@
  	}
  	return netip.Addr{}
  }
