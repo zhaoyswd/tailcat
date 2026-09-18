@@ -538,6 +538,8 @@ func (s *termSession) deliverLocked() {
 func (s *termSession) detachLocked(c *termClient) {
 	if s.attached == c {
 		s.attached = nil
+		// 焦点交还：TUI 停动画（空闲闪烁不再进字节环）。
+		s.focusNudgeLocked(false)
 	}
 	c.close()
 	if s.svc.logf != nil {
@@ -550,6 +552,29 @@ func (s *termSession) pushStateLocked() {
 		if err := c.frame(opState, encState(s.agent, s.state, s.scan.title)); err != nil {
 			s.detachLocked(c)
 		}
+	}
+}
+
+// focusNudgeLocked 向 PTY 写一个终端焦点事件（仅当 TUI 开了 ?1004 焦点上报时才写，
+// 不开的程序读到这些字节只会当普通输入——绝不能发给 bare shell）。
+//
+// 为什么需要它：attach 回放只是**字节环的尾部窗口**，TUI 空闲期的输出全是闪烁级
+// 增量帧——回放灌进客户端的新 vt 后就是「空白屏 + 光标在位」（2026-09-18 真机：
+// codex 会话打开全空，敲一个键立即恢复）。sentinelRepaint 的两次 SIGWINCH 对
+// ratatui 系 TUI 不可靠（它们只标记 pending-resize，等下一个事件才全屏重绘）。
+// focus-in 是标准终端事件：TUI 会立刻全屏重绘——「打开即有内容」由此确定成立。
+// focus-out 同理在 detach 时写：TUI 停止动画（省电），空闲闪烁输出不再进字节环
+// （会话状态的 running 闪烁噪声也随之消失）。
+func (s *termSession) focusNudgeLocked(focusIn bool) {
+	if s.done || s.ptmx == nil || s.scan.modes&termModeFocus == 0 {
+		return
+	}
+	seq := []byte("\x1b[O") // focus-out
+	if focusIn {
+		seq = []byte("\x1b[I") // focus-in
+	}
+	if _, err := s.ptmx.Write(seq); err != nil && s.svc.logf != nil {
+		s.svc.logf("term: 会话 %s focus nudge 写入失败：%v", s.name, err)
 	}
 }
 
@@ -611,6 +636,9 @@ func (s *termSession) attachLocked(c *termClient) error {
 	c.live = true
 	// 回放期间新产生的字节 [c.off, s.written) 由这次 flush 补齐，然后交给 pump 持续投递。
 	s.deliverLocked()
+	// 回放完成后注入 focus-in：逼 TUI 立即全屏重绘（见 focusNudgeLocked 注释——
+	// 回放尾部往往没有全屏帧，SIGWINCH sentinel 又会被 TUI 的 pending-resize 优化吞掉）。
+	s.focusNudgeLocked(true)
 	return nil
 }
 
